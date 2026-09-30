@@ -27,7 +27,7 @@ from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                            BufferedInputFile)
 
 # ─────────────────────────── CONFIG ───────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8301089530:AAG-9donYoAd_hYz_FRRUi-DXMj6Rk_qa9k")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8301089530:AAFNYRfY3vbB7IgPybATo14rsUD4Th-ZONI")
 DB_PATH   = os.getenv("DB_PATH", "bot.db")
 ADMIN_IDS = {5851573541, 728373773}
 
