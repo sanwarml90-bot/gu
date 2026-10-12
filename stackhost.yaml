@@ -1,9 +1,8 @@
 runtime:
-  language: python
-  version: "3.11"
+  image: "python:3.11-slim"
 
 services:
   - type: worker
     name: telegram-bot
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
