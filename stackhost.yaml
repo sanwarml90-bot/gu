@@ -1,8 +1,12 @@
 runtime:
-  image: "python:3.11-slim"
+  image: python:3.12
 
-services:
-  - type: worker
-    name: telegram-bot
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python bot.py"
+commands:
+  package: ""
+  build:
+    - "pip install -r requirements.txt"
+  start: "python bot.py"
+
+repository:
+  branch: main
+  auto_deploy: true
